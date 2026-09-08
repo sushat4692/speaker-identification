@@ -11,6 +11,8 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 
+pub mod projects;
+
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "foreign_keys", true)?;

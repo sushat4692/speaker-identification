@@ -14,6 +14,16 @@ anyhow = "1"
 asr-core = { path = "../../crates/asr-core" }
 asr-audio = { path = "../../crates/asr-audio" }
 serde_json = "1"
+# macOS Keychain storage for the ElevenLabs API key (see the upload
+# screen's settings UI in docs/plan.md).
+# `keyring` has no `default` feature -- without `apple-native` explicitly
+# enabled, it silently falls back to its non-persistent in-memory "mock"
+# store on macOS (confirmed via keyring-3.6.3/src/lib.rs:279-280), which
+# looks like Keychain access but never touches it. Do not drop this feature.
+keyring = { version = "3", features = ["apple-native"] }
+# Project history: same version/feature pin as asr-core's own rusqlite
+# dependency, so both crates' Connections agree on the sqlite build.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [[bin]]
 name = "ime-spike"

@@ -24,69 +24,33 @@
 
 ## 設計上の核心的な判断
 
-1. **話者分離は自前、ASR はクラウドに逃がす** — クラウドASRのdiarizationは録音をまたいだ人物同定ができない（`speaker_0`しか返さない）ため、話者埋め込みは自前で保持する。ASR本体は日本語精度・実装コストの点でクラウドが有利。
+1. 話者分離は自前（`sherpa-onnx` 1.13.7、公式バインディング。自前実装は不採用）、ASRはクラウド（ElevenLabs）——クラウドASRのdiarizationは録音をまたいだ人物同定ができないため。
+2. パイプライン順序は**話者分離→ASR**（一般的な逆）。話者境界が先に確定するので構造的に正確、区間単位で並列化できる。
+3. UIはGPUIネイティブ一本、WebView不使用（`gpui-wry`はz順序・クリッピングの構造的制約あり、`gpui-kit`がIME問題を解決するので不要）。
 
-2. **話者分離パイプラインは自前実装せず `sherpa-onnx` に委ねる** — 当初案（`ort`上にpyannote 3.xを移植）は取り下げ。powersetデコード・窓またぎの順列不変結合・Kaldi特徴量パリティ・閾値較正、いずれも自前実装だと「なんとなく下手」という観測性の悪い失敗を生む。公式`sherpa-onnx`（v1.13.7、k2-fsa本家）が全工程実装済み。
-   > 非公式`sherpa-rs`はアーカイブ済み・非推奨。`pyannote-rs`も停滞——依存しない。
-
-3. **パイプライン順序は話者分離が ASR より前**（一般的な「ASRで全文書き起こし→diarizationとマージ」の逆）:
-   ```
-   音声 → デコード(16kHz mono) → VAD → 話者分離 → 同一話者区間の結合(無音<0.5sで連結、最大30-60秒)
-        → 区間ごとにASR API（前後200-500msの実音声パディング、重複トークンはトリム）→ 用語補正 → セグメント列
-   ```
-   利点: 話者境界がASRより先に確定するので構造的に正確、再生同期タイムスタンプがAPI精度に依存しない、区間単位で並列化できる。短チャンクの精度低下は「そもそも話者/VAD境界で切っている」ことと前後パディングで対策。
-
-4. **UI は GPUI ネイティブ一本、WebView は不使用** — `gpui-wry`はz順序なし・クリッピングなしという構造的制約がありこのアプリには使えない。`gpui-kit`がIME問題を解決するので、そもそもWebViewに逃げる必要がない。
-
----
-
-## 技術選定（検証済み）
+## 技術選定
 
 | 役割 | 採用 | 備考 |
 |---|---|---|
-| 話者分離・話者ID・VAD | `sherpa-onnx` 1.13.7 | 公式バインディング |
-| 音声デコード | `symphonia` 0.6.1 | 0.6は破壊的リライト、0.5系の実例は使えない |
-| リサンプル | `rubato` 5.0 | `Vec<Vec<f32>>`の旧APIは無い、`audioadapter`経由 |
+| 話者分離・話者ID・VAD | `sherpa-onnx` 1.13.7 | |
+| 音声デコード | `symphonia` 0.6.1 | |
+| リサンプル | `rubato` 5.0 | |
 | 形態素解析・読み | `lindera` 6.0 + `lindera-unidic` | |
 | 階層クラスタリング | `kodama` 0.3 | 会議をまたぐ話者統合用 |
 | ASR 既定 / 2番手 | ElevenLabs Scribe v2 (batch) / Azure AI Speech Fast Transcription | |
-| UI フレームワーク | `gpui-kit` 0.6（Apache-2.0） | 実体は`gpui-pre`（Zedの最新gpuiの再公開）。crates.io公式`gpui 0.2.2`は約11ヶ月停滞していて別物 |
-| テキスト編集・IME | `gpui-kit::Textarea` | |
-| 仮想スクロール | `gpui::list` + `ListState` | 可変行高対応。`uniform_list`/`v_virtual_list`は不可（一様高さ前提） |
-| 音声出力・タイムストレッチ | `cpal` + `signalsmith-stretch` 0.1.3 | トランスポートは自前で持つ |
+| UI フレームワーク | `gpui-kit` 0.6（Apache-2.0） | 実体は`gpui-pre`。crates.io公式`gpui`とは別物 |
+| 仮想スクロール | `gpui::list` + `ListState` | 可変行高対応 |
+| 音声出力・タイムストレッチ | `cpal` + `signalsmith-stretch` 0.1.3 | |
 
-**ライセンス**: Zedの`gpui`/`gpui_macos`はApache-2.0、`editor`等はGPL-3.0-or-later（AGPLではない）。社内利用のみなら`convey`が発生せず問題ないが、`gpui-kit`はそもそもGPLクレートを1つも要求しない構成（`editor`不使用、`cpal`+`signalsmith-stretch`直、Ropeも`gpui-kit`側）。
-
-**バージョン地雷**: `symphonia`0.5→0.6で全面書き直し、`rubato`は8ヶ月で1.0→5.0、`lindera`は6週間で4.0→6.0、`ort`と`voice_activity_detector`は同居不可。GPUIはpre-1.0で頻繁に破壊的変更——バージョン厳密固定必須。
-
-**macOS/CoreML**: `sherpa-onnx`既定（静的リンク）ではCoreMLが黙って無効化されCPU実行になる。ANE利用には`shared`featureが必要（署名の手間増）。方針: まず静的リンク・CPUで計測してから判断。
+**バージョン注意**: GPUIはpre-1.0で頻繁に破壊的変更——バージョン厳密固定必須。`ort`と`voice_activity_detector`は同居不可。
 
 ---
 
 ## ASR プロバイダ
 
-**既定 ElevenLabs Scribe v2 (batch)** — 日本語品質「Excellent」を公表、`keyterms`1,000語×50文字という実務規模の用語登録、単語単位タイムスタンプ+logprob。$0.22/hr + keyterms $0.05/hr。
+**既定 ElevenLabs Scribe v2 (batch)**（`crates/asr-core/src/asr/elevenlabs.rs`）——`keyterms`1,000語×50文字、$0.22/hr。**2番手 Azure AI Speech Fast Transcription**（日本リージョンあり、未実装）。
 
-**2番手 Azure AI Speech Fast Transcription** — 日本リージョンあり（調達要件になりうる）、`biasing_weight`という用語バイアス強度ツマミ。バッチ転写では`phraseList`不可（Fast Transcriptionのみ）。
-
-**既定にしないもの**: OpenAI `gpt-transcribe`（タイムスタンプ非対応）、Deepgram Nova-3（keyterm上限が低い）、AssemblyAI（keytermsが日本語非対応）、Google Chirp 3（コスト3.5倍）。
-
-**`Transcriber` trait**: 出力は`セグメント + Option<Vec<Word>>`（単語タイムスタンプ必須にするとOpenAI系が挿せなくなる）。用語リストはプロバイダ上限で切り詰め（エラーにせずdegrade）。
-
-### 実装・実測で分かったこと
-
-- `crates/asr-core/src/asr/elevenlabs.rs`で実装。エンドポイント: `POST /v1/speech-to-text`、`multipart/form-data`、WAVコンテナで送信。
-- レスポンスの`words`は英語的な「単語」ではなく**日本語では1文字単位**。将来の用語補正は文字単位前提で設計する必要がある。
-- **`keyterms`は日本語の固有名詞には安定して効くが、英語由来のカタカナ複合語（例:クラウドゲート）には効果が無い**（「クラウドゲート問題」——単体で渡しても直らない）。これが3層用語補正の第2層が「保険」ではなく「主力」である根拠になった。
-- `run_transcription_stage`で話者分離→チャンク分割→ASRの通し実行を実データ（230秒クリップ、51区間）で確認。逐次実行（並列化・`context_prompt`は未実装、後回し）。
-
-未検証: ファイルサイズ上限（ドキュメント間で3GB/5GBの矛盾）、`timestamps_granularity`既定値。
-
----
-
-## 必要な契約・アカウント
-
-MVP（Phase 0〜1）は契約ゼロで進められる。話者分離・識別・VADは全ローカルで無料。ASRプロバイダ（ElevenLabs or Azure）のみPhase 2で従量課金——1時間の会議で約$0.27〜$0.36、実質無視できるコスト。Apple Developer Program（$99/年）は社内配布時に必要。
+**実測で判明した重要な制約**: レスポンスの`words`は日本語では1文字単位。**`keyterms`は英語由来のカタカナ複合語（例:クラウドゲート）には効かない**——3層用語補正の第2層が「保険」ではなく主力である根拠。
 
 ---
 
@@ -98,8 +62,7 @@ crates/
   asr-cli/     # 評価・バッチ用CLI（DER計測）
   asr-audio/   # 再生エンジン（cpal + signalsmith-stretch）
 apps/
-  desktop/     # GPUIアプリ本体（nightly専用、独立workspace——下記参照）
-  server/      # ※将来
+  desktop/     # GPUIアプリ本体（nightly専用、独立workspace）
 ```
 
 `asr-core`にUI・GPUI・HTTPの都合を持ち込まない規律を守る。これがクラウド化の退路になる。
@@ -115,213 +78,341 @@ speakers(id, name, is_enrolled)                                  -- プロジェ
 speaker_embeddings(id, speaker_id, vector BLOB, source_media_id)
 terms(id, project_id, surface, reading_kana, category, weight, enabled)
 term_aliases(id, term_id, surface, reading_kana)
-corrections(id, media_id, before, after, accepted, created_at)   -- 編集履歴 → 辞書の自動学習
+corrections(id, media_id, before, after, accepted, created_at)   -- 編集履歴 → 辞書の自動学習（未着手）
 ```
 
-`speakers`をプロジェクト横断にすることで会議をまたいだ人物同定ができる。`SpeakerEmbeddingManager`は永続化を持たないので起動時にSQLiteから読み込んで流し込む。
+---
+
+## 専門用語対応（3層）
+
+1. ASR前 — `keyterms`として送出
+2. ASR後・読みベースのファジーマッチ — lindera読み取得 + スライディングウィンドウ（`MAX_WINDOW_TOKENS=6`）
+3. 編集からの学習（未着手） — `corrections`蓄積 → `term_aliases`自動登録提案
+
+**ユーザー辞書 = `terms`テーブルそのもの**（登録すればkeyterms送出とlindera読み取得の両方に効く）。`correction_threshold`は0.7（実データでは既定0.85だと発火しないケースがあった）。
 
 ---
 
-## 専門用語対応（3層・実装済み）
+## 話者識別（enrollment）
 
-1. **ASR前** — `keyterms`/`phraseList`として送出（重み順、プロバイダ上限で切り詰め）
-2. **ASR後・読みベースのファジーマッチ** — lindera読み取得 + スライディングウィンドウ（`MAX_WINDOW_TOKENS=6`、開始位置ごとに1〜6トークン連結窓を全探索、非重複貪欲選択）
-3. **編集からの学習**（未着手） — `corrections`蓄積 → `term_aliases`自動登録提案
+重心embeddingを`SpeakerEmbeddingManager.search()`で既存話者と照合、閾値超えで自動命名。**`cluster_threshold` = 0.9**（実測: 0.5=DER29.2% → 0.9=DER19.6%、0.95以降は頭打ち）——埋め込みモデル固有の値、モデルを変えたら測り直しが必要。
 
-**lindera OOV対策**: ユーザー辞書 = `terms`テーブルそのもの（1回登録すればkeyterms送出とlindera読み取得の両方に効く）。UniDicのユーザー辞書CSVは3フィールド`surface,reading,pronunciation`（IPADIC風13フィールドではない、実装時に判明）。
-
-**実測での主な教訓**:
-- 単一トークンの読み一致では多形態素の誤変換（例:「アシタカ総研」→「明日化総研」）を拾えない → スライディングウィンドウで解決
-- 候補生成で完全一致窓を早期スキップすると、隣接する不完全一致窓（助詞を巻き込む等）に負ける実バグを発見・修正済み
-- CLIの`correction_threshold`既定0.85は実データで発火しないケースがあり0.7に変更（`cluster_threshold`と同型の教訓: 単体テストで動くことと本番既定値で発火することは別物）
-- 登録あり/なし対照実験: TTS音声・n=8出現で**0%→100%**の再現率改善を確認（第2層と第3層がそれぞれ異なる語で実際に効いている内訳も確認）
-- 表記がローマ字・読みが複数ありうるカタカナの逆方向登録も無改修で動作確認済み（linderaの読み正規化のおかげ）
-- 未使用だった`term_aliases.reading_kana`カラムを削除（書くだけで読まれない死んだ列だった）
-
----
-
-## 話者識別（enrollment、実装済み）
-
-各クラスタの重心embeddingを`SpeakerEmbeddingManager.search()`で既存話者と照合、閾値超えで自動命名。ユーザーが命名したらembeddingを追加し重心を更新。
-
-**DERチューニングの実測結果**（230秒・人手ラベル、無音明示あり）:
-
-| cluster_threshold | DER |
-|---|---|
-| 0.5（旧デフォルト）| 29.2% |
-| 0.8 | 21.8% |
-| **0.9（採用）** | **19.6%** |
-| 0.95〜0.99 | 18.9%（頭打ち） |
-
-`cluster_threshold`のデフォルトを0.5→0.9に変更済み。`min_duration_on`はほぼ効かないと実測済み（残る見逃し約23秒はラベリング側の反応遅延が主因の疑い）。この閾値は埋め込みモデル固有——モデルを変えたら測り直しが必要。
-
-**探索モード（`crates/asr-core/src/diarize/fast.rs`、実装済み）**: VAD+固定窓+kodama再クラスタリングによる高速プレビュー。キャッシュ構築127秒（確定モードの約10倍速）、再クラスタリングは正規化+rayon並列化で213〜305ms（当初2.3〜4.5秒から10倍改善）。確定モードとは別アルゴリズムなので閾値も別物（探索0.8 vs 確定0.9〜0.99）——**2つのモードは意図的に自動連携させない**設計（プレビューと本番がズレて見える不信感を避けるため）。
+探索モード（`crates/asr-core/src/diarize/fast.rs`）は別アルゴリズム・別閾値（0.8）——確定モードと意図的に自動連携させない。
 
 ---
 
 ## 音声再生アーキテクチャ
 
-要件: シーク・区間ループ・ピッチ保持のまま0.5〜2.0倍速・60fpsでプレイヘッド。WebView案（`<audio>`/`AudioBufferSourceNode`）はピッチ保持と正確なループの両立ができず却下。`rodio`/`kira`/`cpal`もピッチ保持速度変更を持たない。
-
-**採用**: `signalsmith-stretch` 0.1.3（`process()`/`seek()`/`output_latency()`）。3bスパイクで実音声A/B確認済み（「多分大丈夫」水準、pixel-perfectな網羅チェックはしていない）。
-
-```
-symphonia（デコード）→ PCMキャッシュ → 自前Transport（位置・ループ・レートの単一の真実）
-  → signalsmith_stretch::process()（レート適用、ピッチ1.0固定）→ cpal出力ストリーム
-```
-
-**設計要点**: トランスポートは自前（タイムストレッチはソースの内側に必要、rodio/kiraでは挟めない）。プレイヘッドは`output_latency()`補正必須（省くと数十msずれて気づかれる）。毎フレームポーリングせず外挿+500ms再同期。ループは`stretch.reset()`で継ぎ目防止。スクラブは`stretch.seek(preroll, rate)`。
+要件: シーク・区間ループ・ピッチ保持のまま0.5〜2.0倍速。**採用**: `signalsmith-stretch` 0.1.3（自前`Transport`で位置・ループ・レートを一元管理、`rodio`/`kira`はピッチ保持速度変更を持たないため不採用）。プレイヘッドは`output_latency()`補正必須。ループは`stretch.reset()`で継ぎ目防止。
 
 ---
 
 ## 修正 UI の仕様（GPUI）
 
-**レイアウト**（`tools/diarization-viewer.html`の検証用レイアウトを正として採用——当初の縦積み案から変更）:
-```
-[ツールバー]
-本体（横2カラム）
-  ├─ 左（42%幅）: プレイヤー
-  └─ 右: タイムライン（話者色分け、固定高） + セグメントリスト（flex:1、話者/時刻/テキスト）
-```
-話者パネル・用語パネルは検証用HTMLに無い要素——未着手、実装時に配置決定。
+**レイアウト**: ツールバー＋横2カラム（左: プレイヤー、右: タイムライン＋セグメントリスト）。
 
-**キーマップ**（`Cmd`ベース、IMEが`Ctrl`系を食う問題を回避——実装済み分は✓）:
+**キーマップ**（`Cmd`ベース、IMEが`Ctrl`系を食う問題を回避）:
 
-| キー | 動作 | 状態 |
-|---|---|---|
-| `Cmd+↓`/`Cmd+↑` | 次/前のセグメントへ | ✓ |
-| `Cmd+Shift+Enter` | カーソル位置でセグメント分割 | ✓（当初案の素の`Enter`は誤発火しやすいため変更） |
-| `Cmd+Shift+Backspace` | 前のセグメントと結合 | ✓（同上、素の`Backspace`は`Textarea`内部で消費されるため技術的にも不可だった） |
-| `Cmd+1`〜`Cmd+9` | 話者を割り当て | ✓ |
-| `Cmd+Enter` | 再生/一時停止 | ✓ |
-| `Cmd+Option+←`/`Cmd+Option+→` | 5秒戻す/進める | ✓（当初`Cmd+←`のみだったが、下記の衝突により変更・実機確認済み） |
-| `Cmd+[`/`Cmd+]` | 再生速度 0.5x〜2.0x | ✓ |
+| キー | 動作 |
+|---|---|
+| `Cmd+↓`/`Cmd+↑` | 次/前のセグメントへ |
+| `Cmd+Shift+Enter` / `Cmd+Shift+Backspace` | セグメント分割/結合 |
+| `Cmd+1`〜`Cmd+9` | 話者を割り当て |
+| `Cmd+Enter` | 再生/一時停止 |
+| `Cmd+Option+←`/`Cmd+Option+→` | 5秒戻す/進める |
+| `Cmd+[`/`Cmd+]` | 再生速度 0.5x〜2.0x |
 
-**Textareaキーマップとの衝突**（`gpui-base-0.6.0/src/input/base/state.rs`で実測）: `gpui_kit::init(cx)`の後に`cx.bind_keys()`する自前バインド（`context=None`）は、Textarea自身のcontext付きバインドに**勝つ**。つまり衝突した組み合わせはTextarea側の編集機能を黙って奪う（Textareaにフォーカスがある状態で`Cmd+←`がシークとして発火したことで実測確認）。
+> `Textarea`自身のキーマップと衝突する組み合わせ（`Cmd+←/→`等）は避けている——自前バインドが常に勝つため、衝突するとTextarea側の機能を黙って奪う。新しいキーバインドを足す際はこの衝突に注意。GPUIのキーストローク表記は`alt`のみ有効（`option`ではない）。
 
-| 自前バインド | Textareaから奪うもの | 判断 |
-|---|---|---|
-| `Cmd+↑`/`Cmd+↓` | `MoveToStart`/`MoveToEnd`（テキスト全体の先頭/末尾へ） | 許容——セグメント移動の方が価値が高い |
-| `Cmd+[`/`Cmd+]` | `Outdent`/`Indent` | 許容——文字起こし編集にインデントは不要 |
-| `Cmd+Enter` | `Enter{secondary:true}` | 無害——`submit_on_enter`未設定なので実質何もしない |
-| **`Cmd+Option+←/→`** | **なし**（Textareaのキーマップに存在しない） | ✓ 採用 |
-| ~~`Cmd+←/→`~~ | `MoveHome`/`MoveEnd`（行頭/行末移動） | 却下——日本語編集で頻用 |
-| ~~`Cmd+Shift+←/→`~~ | `SelectToStartOfLine`/`SelectToEndOfLine` | 却下——同上 |
-
-> GPUIのキーストローク表記は`alt`のみ有効（`option`は`InvalidKeystrokeError`）——`"cmd-alt-left"`と書く。
-
-**仮想スクロール・行編集パターン（実装済み）**: `gpui::list`+`ListState`で可変行高対応。非フォーカス行は静的テキスト、フォーカス行だけ実`Textarea`（N個の`TextareaState`を同時に作らない設計——実装・実機検証済み、前例のないパターンだったが問題なく動作）。
+**行編集パターン**: `gpui::list`+`ListState`。非フォーカス行は静的テキスト、フォーカス行だけ実`Textarea`（N個の`TextareaState`を同時に作らない設計）。
 
 ---
 
 ## 評価基盤
 
-1. ラベリングUI（`tools/diarization-viewer.html`、実装済み）
-2. `asr-cli eval` でDER算出＋誤り内訳（実装済み）
-3. pyannoteベースライン併走（評価専用、製品には同梱しない）
-
-**残っているチューニング対象**: 埋め込みモデルの選定（campplus vs WeSpeaker vs TitaNet、日本語での優劣は未検証）。
+ラベリングUI（`tools/diarization-viewer.html`）、`asr-cli eval`でDER算出。**残タスク**: 埋め込みモデルの選定（campplus vs WeSpeaker vs TitaNet、未検証）。
 
 ---
 
 ## 実装フェーズ
 
-### Phase 0/1 — 土台・話者分離（完了）
-`sherpa-onnx`配線、SQLite永続化enrollment、DERチューニング（cluster_threshold=0.9採用）、探索モード実装。
-
-### Phase 2 — ASR と用語辞書（ほぼ完了）
-`Transcriber` trait・ElevenLabs実装・3層用語補正・通しパイプライン、全て実データで実測・検証済み。**未着手**: Azure実装、リクエスト並列化。
+### Phase 2 — ASR と用語辞書
+**未着手**: Azure実装、リクエスト並列化。
 
 ### Phase 3 — 編集 UI（GPUI、進行中）
 
-**3a. 日本語IMEスパイク → go**。実装は`apps/desktop`（nightly専用、独立workspace）。
-> `gpui-kit`が依存する`gpui-pre-util`が未安定Rust機能を使用しておりstableではビルド不可——`apps/desktop`だけ`rust-toolchain.toml`でnightly指定（`RUSTUP_TOOLCHAIN`環境変数がこれを上書きすることがあるため、常に`cargo +nightly ...`を明示すること）。ことえり/Google日本語入力/ATOKの3種で全項目確認、zed#62661の回避策は不要だった。
+完了: セグメントリスト・タイムライン・話者パネル・再生エンジン統合・行単位話者ピッカー・アップロード画面+実パイプライン統合・APIキー設定（Keychain、`Projects`/`Upload`どちらからも開ける独立の`AppScreen::Settings`）。詳細は削除済み——`run_full_pipeline`のAPIは`crates/asr-core/src/pipeline/mod.rs`、APIキーは`apps/desktop`の`load_api_key`/`save_api_key`参照。
 
-**3b. 再生エンジンスパイク → go**。`crates/asr-audio/src/bin/playback_spike.rs`でsignalsmith-stretch（採用）とtimestretch（参考A/B用、リアルタイムAPI無し）を実データで検証。
+**まだ手を付けていないスコープ**（将来）: 話者統合のUndo、話者の新規追加（既存セグメントに出現する話者のみが対象）、cross-project話者enrollmentのGUI配線。
 
-**本実装（状態）**:
-- ~~波形Element~~ → 話者色分けタイムラインのみ実装（振幅波形はユーザー判断で不要と判定）。`speaker_timeline.rs`、`gpui-pre`の`canvas()`ヘルパーで実装（フルElement自前実装は不要）
-- セグメントリスト（読み取り専用→編集→見た目調整、全て完了）。`segment_list.rs` + `editor_layout_demo.rs`
-- `Cmd`ベースのキーマップ（上表参照、完了）
-- asr-audio再生エンジンのGPUI統合（実装済み、下記）
-- タイムラインの強化＋再生中セグメントのハイライト（実装・実機確認済み、下記）
-- 話者パネル（改名・統合・行単位修正、行単位ピッカーのフローティング表示含む） — 実装済み（下記）
-- 用語パネル・書き出し（テキスト/SRT/VTT/Markdown） — **未着手**
+---
 
-#### asr-audio 再生エンジンのGPUI統合（実装済み）
+## 実機検証待ち（実装済み・ユーザーによる確認が未完了）
 
-`crates/asr-audio/src/transport.rs`（新規）— 3bスパイクの`play_signalsmith`を`Transport`構造体に一般化。`cpal::Stream`（保持のみ、ドロップで再生停止）+ `Arc<Shared>`（samples/位置`AtomicUsize`/`playing: AtomicBool`/レート`AtomicU32`（f32ビット）/`Mutex<Stretch>`）。公開API: `new`/`play`/`pause`/`toggle_play_pause`/`seek`/`seek_back`/`set_rate`/`rate`/`is_playing`/`position_ms`/`duration_ms`。
+以下は既に実装済みだが、ユーザーによる実機確認がまだ済んでいない（一部は実機ログで動作を確認済み）。
 
-- `position_ms()`は`output_latency()`補正込み
-- `seek()`は`Stretch::seek(preroll, rate)`にプリロール（`input_latency()`フレーム分）を与えて継ぎ目を減らす
-- 終端到達で自動的に`playing=false`＋以降は無音を返す（スパイクで踏んだ「終了後もコールバックが回り続ける」バグと同型の対策を最初から組込み）
-- `play()`は終端で止まっていたら位置0に戻してから再生
+### エディタ画面の実機フィードバック6件（実装済み）
 
-`apps/desktop/src/bin/editor_layout_demo.rs` — CLI引数`[json_path] [media_path]`（既定`../../debug-data/clip_230s.mp4`）、`transport: Arc<Transport>`保持、左カラムを▶/⏸＋`mm:ss / mm:ss`＋倍速表示に差し替え（クリックでも再生切替）、`cx.spawn`＋`cx.background_executor().timer(200ms)`で再生中のみ`cx.notify()`。
+(1c)/(1d)/(1e)を一通り実装した後にユーザーから届いた6件のフィードバック。全て対応済み:
 
-**実測**: ビルド・clippy警告ゼロ。`clip_230s.mp4`のデコード＋出力デバイス確保まで確認（`loaded audio: 230037ms`——JSONの229902msとほぼ一致）。ただしmp4全体のデコードに10秒以上かかる（起動が遅い）——将来的にストリーミングデコードか事前キャッシュを検討。
+1. **タイムラインの中央追従が再生中に効かない** → **原因確定・修正済み・実機ログで動作確認済み**。`#timeline-scroll`自体がflexコンテナではなく、その直下の「左右パディング＋本編」の行が明示的な幅を持たないため、GPUIが行の幅を「子要素の合計」ではなく「ビューポート幅にストレッチ」して測定し、スクロール可能な超過幅をゼロと誤認していた（`max_offset.x == 0`→どんなオフセットを設定してもGPUI自身のクランプで即座に0に戻る）。行に明示的な合計幅（`half_viewport*2 + content_width`）を与えて解決。実機ログで`max_offset`が`0px`→`8340px`等の正しい値になり、実際の再生中に毎フレームのオフセットが連続的に変化する（0にクランプされ戻らない）ことを確認済み。
+2. **一時停止中にドラッグ/スクロールバーでスクロールしたい** → `gpui_component::scroll::Scrollbar`を試したが、その内部実装（`gpui-base-0.6.0/src/scrollbar.rs`）はマウスダウンされた領域全体（100%/100%に自己サイズする）を「クリックでジャンプ」として扱い`cx.stop_propagation()`するため、シーククリックと共存できず、さらに専用の行に分離しようとすると今度は完全に非表示になる（コンポーネント自身のサイズ解決の癖に起因、深追いせず撤退）。**最終的に自前のドラッグ実装に切替**——`#timeline-scroll`に`on_mouse_down`/`on_mouse_move`/`on_mouse_up`を実装し、移動量が4px未満なら「クリック＝シーク」、それ以上なら「ドラッグ＝パン」として扱う（`begin_timeline_drag`/`continue_timeline_drag`/`end_timeline_drag`、`EditorLayoutDemo::timeline_drag`フィールド）。実機ログで、一時停止中に大きくオフセットが変化した後にシークが行われる、という実際のドラッグ操作に整合するパターンを確認済み。
+3. **キーマップがTextareaフォーカス時しか反応しない** → **原因確定・修正済み**。GPUIの`Window::dispatch_action`はフォーカスされた要素からバブリング（上方向のみ）でディスパッチするため、`FocusHandle`を持つ要素がTextarea以外に一つも無いこのアプリでは、何もフォーカスされていない時にキーマップ用`.on_action`群へ絶対に届かなかった。`EditorLayoutDemo`に`focus_handle: FocusHandle`を追加し、外側のdivに`.track_focus(&self.focus_handle)`。`render()`の先頭で「何もフォーカスされていなければ自分のハンドルにフォーカスする」（`window.focused(cx).is_none()`のガード付きなので、Textareaフォーカス中は奪わない）。
+4. **プロジェクト一覧に戻るボタンが無い（エディタ画面）** → `AppRoot::render`の`AppScreen::Editor`分岐に、`EditorLayoutDemo`自体には手を入れずヘッダーを追加（`flex_col`の兄弟として配置、`editor.clone()`は`flex_1().min_h(px(0.0))`でラップするだけで正しく縮む）。離脱前に`editor.update(cx, |view, cx| view.persist(cx))`で強制保存してから(1e)の`back_to_projects`を呼ぶ。
+5. **再生速度をボタンでも変更したい** → プレイヤー欄のレート表示の両脇に「−」「＋」ボタンを追加、既存の`rate_down`/`rate_up`をそのまま呼ぶ（新規ロジック無し）。
+6. **-30秒/-5秒/+5秒/+30秒のシークボタン** → `seek_back`/`seek_forward`を`ms: u64`引数付きに一般化（既存のキーマップは`Self::SEEK_STEP_MS`=5秒を渡すよう据え置き）、プレイヤー欄に4ボタン追加。
 
-**follow-up**: シークのキーマップ修正（`SeekForward`未実装＋`Cmd+←`のTextarea衝突、`Cmd+Option+←/→`へ変更）は実装・実機確認済み（完了）。残る未着手: ループ再生UI。タイムラインのプレイヘッド表示・クリックシーク・再生中セグメントの自動ハイライトは次のタスクとして着手する（下記）。
+**ついでに対応**: セグメント行のタイムスタンプ表示をクリックするとその時刻へシークするようにした（`cx.stop_propagation()`で行自体の`focus_row`とは独立）。
 
-#### タイムラインの強化＋再生中セグメントのハイライト（実装・実機確認済み）
+**変更したファイル**: `apps/desktop/src/bin/editor_layout_demo.rs`のみ。ビルド・clippyとも警告ゼロ、診断用の一時的な`eprintln!`は全て削除済み。
 
-検証用HTML（`tools/diarization-viewer.html`）を移植: ルーラー付きタイムライン（`timeline_ruler`、`niceTickInterval`移植）、ズームボタン（`pxPerSec`相当の`pixels_per_second`、既定40・×1.5/÷1.5・[2,800]クランプ）、`overflow_x_scroll`による横スクロール、プレイヘッド線、クリックシーク、セグメントリストの再生中行ハイライト（`rgba(0x5b9cf62e)`）。`apps/desktop/src/speaker_timeline.rs`・`editor_layout_demo.rs`に実装。
+**未検証（実機での操作が必要）**: (1)(2)は実機ログで強く裏付けが取れているが、ユーザー自身の目視確認はまだ。(3)〜(6)とタイムスタンプクリックは未検証——実機で個別に確認してもらう必要がある。
 
-**実機で踏んだバグとその修正**:
-- タイムラインの高さは検証時にユーザー希望で半分に縮小（74px→46px、ルーラー18px+ブロック28px）
-- **一時停止中にアクティブ行を越えてスクロールできない**バグ——原因は、スクロール自体が`render()`を再実行させ、「アクティブ行が画面外にあるか」だけを条件に`scroll_to_reveal_item`を呼んでいたため、ユーザーが手動でスクロールした瞬間に毎回引き戻していた。`last_highlighted_ix: Option<usize>`を追加し、**現在再生中のセグメント自体が変わった時だけ**（再生が進んだ/シークした時）追従するよう修正——手動スクロールでは`current_ix`が変化しないため引き戻されなくなった。
+### (1e) 設定画面をUpload/Projects共通のトップレベル画面に昇格
 
-#### 話者パネル（改名・統合・行単位の修正）（実装済み、実機確認中）
+**Context**: 「設定 (APIキー)」ボタンが`UploadScreen`にしか無く（`UploadMode::Settings`という`Upload`専用のサブモード）、プロジェクト一覧からは「新規作成」を経由しないと辿り着けなかった。ユーザーから「設定は新規にあるのは良くない」と指摘があり修正。
 
-話者に名前を付けられるようにし（話者ごとに常時編集可能な`Textarea`を保持する`speaker_name_states: HashMap<i32, Entity<TextareaState>>`——`speaker_label()`がここから表示名を解決、空なら`S{id}`にフォールバック）、誤って分裂した話者の統合（`SpeakerMergeUi::PickingTarget`→`ConfirmingMerge`の2段階、確認なしでは実行されない——不可逆操作のため）、セグメント行の話者バッジをクリックした行単位の修正（`row_speaker_picker_open_for`、Cmd+1〜9とは独立、人数上限なし）を実装。両ピッカーは`speaker_option_row()`という共通コンポーネントで実装。左カラムはプレイヤー（`flex_none`）＋話者パネル（`flex_1`・`overflow_y_scroll`）の縦積みに変更。
-
-**変更したファイル**: `apps/desktop/src/speaker_timeline.rs`（`speaker_color`を`pub`に）、`apps/desktop/src/bin/editor_layout_demo.rs`。ビルド・clippy警告ゼロ、実機起動確認済み。
-
-**スコープ外（follow-up）**: SQLite永続化（`speakers`テーブルへの反映、プロジェクトをまたいだ話者名の記憶）、統合のUndo、話者の新規追加（現状は既存セグメントに出現する話者のみが対象）。
-
-#### セグメント行レイアウトの修正（実装・実機確認済み）
-
-時刻・話者名を1行目、本文（または編集中のTextarea）を2行目に配置する2行レイアウトに変更（話者名が可変長になったため、旧来の横3セル固定幅レイアウトでは長い名前が入り切らなくなったことへの対応）。`approximate_text_column_width()`（`focus_row`の初期行数プリ計算）も本文が単独行になったことに合わせて単純化。`apps/desktop/src/bin/editor_layout_demo.rs`のみ変更。ビルド・clippy警告ゼロ、実機起動確認済み。
-
-#### 行単位修正ピッカーのフローティング化（実装済み、位置は実測補正値・原因不明のまま許容）
-
-`deferred()`+`gpui_kit::base::Positioner::side()`でバッジ直下に浮かせる実装を行い、ビルド・clippyは通ったが、実機確認で位置がズレる上に**表示された瞬間に正しい位置へワープする**バグが発生（ユーザーがスクリーンショット付きで報告）。
-
-**原因**: バッジの実座標を書き込む`badge_bounds: Rc<Cell<Bounds<Pixels>>>`への書き込みを`if row_speaker_picker_open_for == Some(ix) { ... }`で**開いている行だけ**に絞っていたため、クリックして開いた**その1フレーム目**は、まだ一度もこの行の座標が書かれていない状態（前回値＝ゼロ/デフォルト、または全く無関係な別行の値）でポップアップを位置決めしてしまい、誤った位置で一瞬表示 → 次に何らかの理由で再描画が起きた瞬間（このフレームのprepaintで初めて正しい座標が書き込まれるため）に正しい位置へ飛ぶ、という2段階の表示になっていた。
-
-ユーザーへの確認の結果、**gpui-component側の既成コンポーネント（`Popover`/`DropdownMenu`は`Positioner::corner`でバッジに重ねる方式、`Select`/`Combobox`は`Positioner::side`を使うが専用の重い`SelectState`が必要）はどれも今回の用途に合わないため不採用**とし、**自前のフローティング実装のまま、座標書き込みのタイミングだけ修正**する方針で合意。
-
-**修正設計**: 「開いている行だけ書き込む」条件をやめ、**表示されている全ての行が毎フレーム無条件に自分の座標を書き込む**ようにする——`badge_bounds`を`Rc<Cell<Bounds<Pixels>>>`（単一・条件付き書き込み）から`Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>`（行indexごと・常時書き込み）に変更:
+**設計**: `Settings`を`Upload`専用のサブモードから`AppScreen`のトップレベルの一variantに昇格——`Projects`・`Upload`どちらからも開けて元の画面に戻れるようにした:
 ```rust
-// バッジの on_prepaint（条件なし、全行毎フレーム）
-.on_prepaint({
-    let badge_bounds = badge_bounds.clone();
-    move |bounds, _window, _cx| {
-        badge_bounds.borrow_mut().insert(ix, bounds);
-    }
-})
-// ポップアップ位置決め時の読み出し
-let bounds = badge_bounds.borrow().get(&ix).copied().unwrap_or_default();
+enum AppScreen {
+    Projects(ProjectsScreen),
+    Upload(UploadScreen), // mode: UploadMode フィールドは削除
+    Editor(Entity<EditorLayoutDemo>),
+    Settings { api_key_input: Entity<InputState>, error: Option<String>, return_to: Box<AppScreen> },
+}
 ```
-これでクリックされた時点で「その行は既に画面に表示されている＝直前のフレームで座標が書き込み済み」という状態が保証されるため、初回フレームからワープなしで正しい位置に表示されるはず（`gpui::list`は仮想化されているが、クリックできる＝現在レンダリングされている＝毎フレーム座標を書き込んでいる、という前提が常に成り立つ）。スクロール中はバッジの座標が動き続けるため1フレーム遅れが理論上あるが、連続的な動きなので体感できない見込み（今回のバグは「開いた瞬間の1回限りのワープ」という不連続な見え方だったのが問題で、連続的な追従ラグとは性質が異なる）。
+`return_to`に開いた時点の画面（`projects`/`error`や`media_path`/`status`を保持したまま）を丸ごと退避し、「戻る」「保存」で復元（`std::mem::replace`で取り出し／書き戻し）。保存失敗時は`Settings`の`error`フィールドにその場で表示するよう修正——旧実装は`upload.status`にエラーを書いていたが、Settingsサブビューの早期returnに阻まれて**一切表示されない潜在バグ**だったため、ついでに直した。当初`ProjectsScreen`のヘッダーにも同じ「設定 (APIキー)」リンクを追加したが、その後ユーザーから「新規画面から設定ボタン削除してください」との指示があり、**`Upload`側のリンクは削除**——設定へのアクセスは`Projects`画面のみ（`Settings`自体は引き続き`return_to`で任意の画面から開けるトップレベルvariantのまま、Upload側の導線を無くしただけ）。
 
-`deferred`/`Positioner::side`/`.occlude()`/`on_mouse_down_out`によるフローティング自体の組み立てとdismiss処理は変更しない（バグの原因ではないため）。マップは行数分（現状51件程度）しか増えず、スプリット/マージでindexがズレても次のフレームで上書きされるだけなので実害はない。
+**変更したファイル**: `apps/desktop/src/bin/editor_layout_demo.rs`のみ。ビルド・clippyとも警告ゼロ、起動スモークテスト（クラッシュ無し）確認済み。
 
-**変更するファイル**: `apps/desktop/src/bin/editor_layout_demo.rs`のみ（`badge_bounds`の型変更、バッジの`on_prepaint`から条件分岐を削除、ポップアップ位置決めの読み出し先変更）。
+**未検証（実機での操作が必要）**: (1) プロジェクト一覧から直接「設定」を開き、保存→一覧に戻れるか（一覧の内容が保持されているか） (2) アップロード画面からも従来通り開けるか（`media_path`/進行状況が保持されているか） (3) 保存に失敗した場合その場にエラーが表示されるか。
 
-**この修正後もまだズレていた（ユーザー実機報告・スクリーンショット添付）**: バッジのテキストに明示`text_size`/`line_height`を付けても改善せず、位置は依然「本文の下」——スクリーンショットで確認すると、ピッカーが**ヘッダー行の直下ではなく行全体（本文込み）の一番下、次の行の直前**に出ている。これは「バッジ自身の座標」ではなく「行全体の座標」を掴んでしまっていることを示す。
+---
 
-**根本原因（特定）**: `gpui_kit::base::ElementExt::on_prepaint`は内部で対象要素に`canvas(...).absolute().size_full()`を子として追加し、そのcanvasのprepaint時の実座標を読む仕組み（`gpui-base-0.6.0/src/element_ext.rs`）。`size_full()`は「親のサイズの100%」だが、バッジ自身はテキスト内容に応じた可変幅・自動高さ（`flex_none()`のみで明示的な`.h(px(_))`を持たない）——**明示的な確定サイズを持たない要素は、absolute配置の子にとって有効な基準（containing block）として扱われず、taffyのレイアウト解決が確定サイズを持つ祖先まで遡ってしまう**。この行では`row`（`.w_full()`）が最初に確定サイズを持つ祖先になるため、`size_full()`が指す範囲が「バッジ」ではなく「行全体」になり、結果としてバッジ自身ではなく行全体の下端を座標として拾っていた。
+### (1c) UI調整: プレイヘッドの中央追従＋話者バッジの色分け
 
-**修正（試みたが不十分）**: バッジ（および揃えるため時刻ラベルも）に明示的な`.h(px(16.0))`を追加し、確定サイズを持つ要素にした。ビルド後、実際に`badge_bounds`へ書き込まれる値をログ出力（`eprintln!`）で確認したところ、**捕捉座標自体は今回は正しくなっていた**（例: `origin: (715, 275), size: (16, 16)` — バッジ相当の小さい妥当な値）。それでもユーザー実機では依然ポップアップが約1行分下にズレて表示された——つまり「入力（バッジの実座標）は合っているのに出力（実際の描画位置）だけがズレる」状態。
+**Context**: (1)/(1b)が実機で通ったあと、ユーザーから実際に使ってみての調整要望が2点。(a)「タイムラインの現在バーを常に中央に表示してほしい」——現状は`tools/diarization-viewer.html`から移植した端10%マージンのエッジトリガ追従なので、再生中プレイヘッドが左右に行ったり来たりして視線が安定しない。(b)「文字起こしの各行のスピーカー名に各スピーカーの色をつけて区別しやすくしてほしい。ポップオーバーの選択肢の様な表示がいいのかも」——現状のバッジは話者に関係なく一律`rgb(0x88aaff)`のプレーンテキストで、タイムラインや話者パネルの色分けと繋がっていない。
 
-**内部実装まで調査**: `gpui-base-0.6.0/src/positioner.rs`の`Positioner::prepaint`を読み、`offset = position.bounds.origin - bounds.origin`という差分を`window.with_element_offset`で子に適用する仕組みを確認。理論上は`Positioner`自身の`bounds`も、`trigger_bounds`（バッジの`on_prepaint`が捕捉した値）も、同じ`Window::layout_bounds()`（ローカル座標＋その時点の`element_offset()`）で計算されるため、`gpui::list`の仮想スクロールの中でも数式上は自己整合するはずだった。しかし実機ではズレが残り、GPUI本体のソースを読むだけではこれ以上の特定はできなかった——`deferred`+`Positioner::side`が`gpui::list`の仮想化スクロールと組み合わさる場面はライブラリ自身もテストしていない未検証の組み合わせであり、そこに何らかの前提の崩れがあると考えられる。
+**ユーザーへの確認結果**: (1) 追従は**プレイヘッドが動いた時だけ**（一時停止中は手動横スクロールを許す。セグメントリスト側で踏んだ「自動追従が手動スクロールを引き戻す」バグと同じ轍を踏まないため） (2) 先頭・末尾でも**空白を足して完全に常に中央**（クランプではなく） (3) バッジは**枠線ピル**（`speaker_option_row`のピルと同じ見た目、枠と文字が話者色）。
 
-**最終対応（ユーザー合意）**: 根本原因の特定（`gpui-base`をローカルにパッチしてinternal printを仕込む等）は工数が大きいため見送り、**実測に基づく補正値で妥協**する方針で合意。`.offset(px(2.0))`を`.offset(px(-70.0))`に変更——観測された行の高さ（65〜85px程度）から「約1行分下にズレる」ぶんを差し引いた値。原因不明の経験的な補正であり、行の高さは内容によって変わるため全ての行で完全には合わない可能性がある——ウィンドウサイズやフォント設定を変えた場合は再調整が必要になりうる。デバッグ用の`eprintln!`は削除済み。
+---
 
-**変更するファイル**: `apps/desktop/src/bin/editor_layout_demo.rs`のみ（`badge_bounds`の型変更、バッジの`on_prepaint`から条件分岐を削除、ポップアップ位置決めの読み出し先変更、`Positioner::side`の`offset`を実測補正値に変更）。
+**(a) プレイヘッドの中央追従**
 
-**検証方法**: `cd apps/desktop && cargo +nightly build --bin editor-layout-demo`（+`clippy --all-targets`）後、実機で——(1) バッジをクリックした瞬間、ワープせず一発でバッジの近くに表示されるか (2) リストをスクロールしながら開閉しても位置が大きく崩れないか (3) 候補選択・外側クリックでの閉じる動作が引き続き機能するか。**実測済み・ユーザー承認済み（2026-09-08）**。
+現行の`follow_timeline_playhead`（`editor_layout_demo.rs:463-481`、10%マージンのエッジトリガ）を中央追従に置き換える。
+
+1. **タイムラインのスクロール内容に左右の余白を追加**（`editor_layout_demo.rs`の`#timeline-scroll`の子、:1135-1151）。現状は`w(timeline_content_width(...))`の縦積み1枚だけが子になっているので、これを横並びの3要素`[余白][既存の縦積み][余白]`に変える。余白幅は`viewport_width / 2`（`self.timeline_scroll.bounds().size.width`から取る——前フレームの値だが、後述の通りオフセット計算と同じ値を使うので自己整合する）。
+
+2. **オフセットは単純な式になる**。余白が`viewport/2`ちょうどなので、プレイヘッドをビューポート中央に置くオフセットは
+   ```
+   offset.x = viewport.width/2 - (pad + playhead_px) = -playhead_px
+   ```
+   に簡約される（`pad == viewport.width/2`）。さらにコンテンツ全幅が`pad + real + pad = real + viewport`になるため`max_offset.x == real`となり、`-playhead_px`は`t=0`で`0`、末尾で`-real`と、**GPUIのクランプ範囲`[-max_offset.x, 0]`にちょうど収まる**（クランプが一度も発動しない＝先頭・末尾でも例外なく中央になる）。GPUIは`div.rs:2429`のprepaintでオフセットを自動クランプするので、こちら側で手動クランプを書く必要は無い。
+   ```rust
+   /// Returns whether it actually applied (false before first layout).
+   fn center_timeline_playhead(&self, playhead_ms: u64) -> bool {
+       let viewport = self.timeline_scroll.bounds();
+       if viewport.size.width <= px(0.0) { return false; } // no layout yet
+       let playhead_px = px(playhead_ms as f32 / 1000.0 * self.pixels_per_second);
+       let offset = self.timeline_scroll.offset();
+       self.timeline_scroll.set_offset(point(-playhead_px, offset.y));
+       true
+   }
+   ```
+
+3. **呼ぶタイミング**——`last_highlighted_ix`と同じメモ化パターンで「プレイヘッドが動いた時だけ」にする。`EditorLayoutDemo`に`last_centered_playhead_ms: Option<u64>`を追加し、`render()`の現行`if self.transport.is_playing() { self.follow_timeline_playhead(...) }`（:560-562）を置き換える:
+   ```rust
+   if self.last_centered_playhead_ms != Some(playhead_ms)
+       && self.center_timeline_playhead(playhead_ms)
+   {
+       self.last_centered_playhead_ms = Some(playhead_ms);
+   }
+   ```
+   `center_...`が`false`を返した時はメモを更新しない（初回レイアウト前にビューポート幅0で「中央化済み」と記録してしまい、以後プレイヘッドが動くまで永久に中央化されなくなるのを防ぐ）。一時停止中は`position_ms()`が変化しない＝再中央化が走らないので、手動横スクロールが引き戻されない。
+   > **ズーム時の追加考慮**: `pixels_per_second`が変わるとプレイヘッドのピクセル位置が変わるのに`playhead_ms`は変わらないため、このメモ化だけだとズーム後に中央からズレたままになる。`zoom_in`/`zoom_out`（:433-441）で`self.last_centered_playhead_ms = None`にして次のrenderで強制的に再中央化する。
+
+4. **クリックシークは変更不要**。`seek_to_timeline_x`（:448-454）はcanvasの実描画座標`timeline_bounds.origin.x`を基準にしており、先頭余白のぶんも自動的に織り込まれる。左余白のクリックは`.max(px(0.0))`で0に、右余白のクリックは`Transport::seek`側が`total_frames`でクランプする（`crates/asr-audio/src/transport.rs:164`）ので、どちらも安全。
+
+**(b) 話者バッジの色分け（枠線ピル）**
+
+`speaker_option_row`のピル（:174-191: `px_1().py(px(2.0)).rounded_md().border_1().border_color(color).text_size(px(11.0))`）と同じ見た目を、セグメント行のバッジ（:618-643）にも適用する。両者が確実に同じ見た目であり続けるよう、スタイルだけを当てる小さなジェネリックヘルパーを1つ切り出して両方から使う（`Div`と`Stateful<Div>`のどちらにも当てられるよう`E: Styled`で受ける——バッジは`.id()`済みで`Stateful<Div>`になっているため）:
+```rust
+fn style_speaker_pill<E: Styled>(el: E, color: Hsla) -> E {
+    el.flex_none().px_1().py(px(2.0)).rounded_md()
+        .border_1().border_color(color)
+        .text_size(px(11.0)).line_height(Rems(1.0)).text_color(color)
+}
+```
+バッジ側は現行の`.text_color(rgb(0x88aaff))`／`.text_size(px(12.0))`を捨ててこれに差し替え、`speaker_color(seg.speaker)`を渡す。`speaker_option_row`側も同じヘッダー経由にして、文字色が話者色になる（＝ピッカーの選択肢と行のバッジが完全に同一の見た目になる）。これは話者パネルの統合ピッカーにも同時に効くが、タイムライン・話者パネルのスウォッチと同じ`speaker_color`で統一される方向なので望ましい変化。
+
+> **注意（実機で要確認）**: バッジに`py(2px)`＋`border 1px`が付くぶん高さが約6px増え、`badge_bounds`が変わる。行単位ピッカーの位置は原因未特定のまま`.offset(px(-70.0))`という実測補正値に依存している（上の「行単位修正ピッカーのフローティング化」参照）ので、**この変更でピッカーの表示位置が数px下にズレる可能性がある**。実機で確認し、ズレていればこの定数を再調整する。
+
+**変更するファイル**: `apps/desktop/src/bin/editor_layout_demo.rs`のみ（余白付きタイムライン構造、`follow_timeline_playhead`→`center_timeline_playhead`、`last_centered_playhead_ms`フィールド、`zoom_in`/`zoom_out`でのメモ無効化、`style_speaker_pill`ヘルパーとバッジ／`speaker_option_row`への適用）。`speaker_timeline.rs`は変更不要（余白はスクロールコンテナ側の兄弟要素として足すため、canvasの座標系は今のまま）。
+
+**検証方法**: `cd apps/desktop && cargo +nightly build --bin editor-layout-demo` / `clippy --all-targets` の後、実機（ユーザー操作）で——(1) 再生中、プレイヘッドが常に画面中央に留まるか (2) 先頭・末尾でも中央のままか（左右に空白が出る） (3) 一時停止中にタイムラインを手で横スクロールしても引き戻されないか (4) ズームしても中央が保たれるか (5) タイムラインのクリックシークが従来通り正しい位置に飛ぶか (6) 各行のバッジが話者ごとの色のピルになり、タイムライン／話者パネルの色と一致しているか (7) **バッジをクリックした時のピッカーの表示位置がズレていないか（ズレていれば`-70.0`を再調整）**。
+
+**実装状況**: 実装済み。`style_speaker_pill<E: Styled>`ヘルパーを追加し`speaker_option_row`のピルとセグメント行バッジの両方に適用（バッジは`speaker_color(seg.speaker)`で色分け）。`follow_timeline_playhead`を`center_timeline_playhead`（`offset.x = -playhead_px`、`viewport/2`の左右パディングにより自己クランプ）に置き換え、`last_centered_playhead_ms`によるメモ化で「プレイヘッドが動いた時だけ」再センタリング、`zoom_in`/`zoom_out`でメモをリセットして強制再センタリング。ビルド・clippyとも警告ゼロ、起動スモークテスト（`pipeline_transcript.json`+`clip_230s.mp4`、クラッシュ無し）確認済み。
+
+**未検証（実機での目視・操作確認が必要）**: 上記「検証方法」の(1)〜(7)全て——特に(7)のピッカー位置ズレ（バッジの高さが`py(2px)+border 1px`分増えたため）は実機でないと分からない。
+
+---
+
+### (1d) プロジェクト履歴（過去の文字起こし結果の一覧・再オープン・編集の自動保存）
+
+**Context**: ユーザーから「履歴機能ってまだ用意てなかったっけ」と質問があり、調査の結果**未実装**と確定した（`editor_layout_demo.rs`に`AppScreen::Upload`と`AppScreen::Editor`の2画面しか無く、過去のプロジェクト一覧・再オープン画面は存在しない。さらに調べると、パイプライン完了後の文字起こし結果は**一切ディスクに保存されておらず**、アプリを閉じると完全に消える——実際に課金・時間のかかるASR実行をした直後にウィンドウを閉じたら結果が丸ごと失われる、という見過ごせないギャップだった）。ユーザーへの確認の結果、(1) パイプライン完了後の編集もDBに保存する (2) 起動時にまずプロジェクト一覧を表示する、の両方を実装することで合意。
+
+**スコープ上の判断（ここで決め、実装時に踏襲する）**:
+- **DB保存先**: `~/Library/Application Support/speaker-identification/app.db`（Keychainの`KEYCHAIN_SERVICE`と同じアプリ識別子で統一）。`dirs`クレートは追加せず`$HOME`から素朴に組み立てる（このアプリは既にmacOS専用の作りのため）。
+- **話者の永続化はプロジェクトローカルに限定**——`speakers`テーブルはスキーマ上「プロジェクト横断」（enrollment用）だが、そのenrollment機構自体がまだGUIに配線されていない（話者パネルのfollow-upとして既に別途スコープ外にしてある）。今回はプロジェクト作成時に、その時点の`distinct_speakers`ごとに新規`speakers`行を1つずつ発行し、以後そのプロジェクトの中でだけ使い回す。プロジェクトをまたいだ「同一人物」の統合は行わない（将来のenrollment配線という別タスク）。
+- **`original_text`/`asr_confidence`/`edited_at`列は今回は使わない**——`corrections`テーブルと同様、「編集前後の差分を追跡する」機能は別の未着手タスク（Phase 4「編集履歴からの用語自動学習」）として明確に切り離す。今回は`text`と`original_text`に同じ値を書き、`edited_at`/`asr_confidence`はNULLのままにする。編集の巻き戻し（真のUndo）や「元の文言との差分表示」は提供しない。
+- **プロジェクト名は自動**——メディアファイルのファイル名（拡張子抜き）をそのまま使う。リネームUIは無し（未依頼、スコープ外）。
+- **開発用ショートカット（CLI引数`[json_path] [media_path]`）はDBを一切通さない**——これはデバッグ用の軽量パスとして意図的に維持し、実プロジェクトDBを汚染しない。この起動経路では自動保存もされない。
+- ~~バックナビゲーション無し~~——当初はプロジェクト一覧→アップロード画面を一方向としたが、後日ユーザーから「新規画面に戻るボタンを追加してください」との指示があり追加済み（`back_to_projects`、`AppRoot::open_upload`のすぐ下）。パイプライン実行中は無効化——`start_pipeline`のポーリングループは`self.screen`が`Upload`でなくなった瞬間に`Next::Stop`で抜けるため、実行中に離脱すると結果が保存されずに消える。この無効化ガードは呼び出し側（`render`のクリックハンドラ）だけに置き、`back_to_projects`自体はガードを重複させない。
+- **自動保存のトリガーは「dirtyフラグ＋定期タイマー」方式**——個々の変更操作（本文コミット・分割・結合・話者割当×2箇所・話者名変更・話者統合）それぞれに保存呼び出しを埋め込むのではなく、既存の200msポーリングパターン（再生位置更新）と同じ仕組みで2秒間隔の定期タイマーを追加し、`dirty`フラグが立っていれば保存して降ろす、という1本の経路に統一する。各変更操作は`dirty = true`をセットするだけでよく、保存処理自体を各所に重複させない。
+
+**設計**:
+
+1. **`crates/asr-core/src/store/projects.rs`（新規）**——`terms/store.rs`と同じ立て付け（`asr-core`がSQLiteを知る唯一の場所という規律を維持）:
+   ```rust
+   pub struct ProjectSummary { pub id: String, pub name: String, pub created_at: String, pub media_path: String, pub segment_count: i64 }
+   pub fn list_projects(conn: &Connection) -> Result<Vec<ProjectSummary>>;
+   // projects + media（1プロジェクト1メディア前提、現行の設計と一致） + segmentsのCOUNTをJOIN、created_at降順
+
+   pub fn create_project(conn: &Connection, name: &str, media_path: &Path) -> Result<(String /*project_id*/, String /*media_id*/)>;
+   // projects行 + media行（duration_ms等は今回追跡しないのでNULLのまま）を挿入
+
+   pub fn get_media_path(conn: &Connection, project_id: &str) -> Result<PathBuf>;
+
+   /// (project-local index -> speakers.id) のマップを新規発行する。
+   /// プロジェクト作成直後、初回保存の一部として1回だけ呼ぶ。
+   pub fn create_speakers(conn: &Connection, names: &HashMap<i32, String>) -> Result<HashMap<i32, String>>;
+
+   /// 話者行の名前をUPDATE、かつ現在のセットに存在しない古いid（話者統合で
+   /// 消えた話者）を削除する。呼び出し元が持つ `speaker_db_ids` を単一の
+   /// 真実の対応表として使い続けられるよう、削除は行わず返り値も無し
+   /// （`speaker_db_ids` からの除去は呼び出し元の責務）。
+   pub fn sync_speaker_names(conn: &Connection, speaker_db_ids: &HashMap<i32, String>, names: &HashMap<i32, String>) -> Result<()>;
+   pub fn delete_speaker(conn: &Connection, speaker_id: &str) -> Result<()>; // 統合で消えた話者用
+
+   /// media_idの既存segmentsを全削除して`segments`を丸ごと入れ直す
+   /// （差分更新ではなく毎回全置換——編集の同一性を追跡する必要が
+   /// 無い今回のスコープでは単純さが勝る）。トランザクションで実行。
+   pub fn save_segments(conn: &mut Connection, media_id: &str, segments: &[TranscriptSegment], speaker_db_ids: &HashMap<i32, String>) -> Result<()>;
+
+   /// 再オープン用: segmentsをspeakersにJOINして読み込み、出現順に
+   /// 0,1,2,...のプロジェクトローカルindexを新規に割り振る。この
+   /// indexはDBには存在しない——セッション内だけで完結する一時的な
+   /// 割当てで、`TranscriptSegment.speaker`（既存のi32）が要求するもの。
+   pub fn load_project(conn: &Connection, project_id: &str) -> Result<(PathBuf /*media_path*/, Vec<TranscriptSegment>, HashMap<i32, String> /*speaker_names*/, HashMap<i32, String> /*speaker_db_ids*/)>;
+   ```
+
+2. **`apps/desktop/Cargo.toml`**——`rusqlite = { version = "0.32", features = ["bundled"] }`を追加（`asr-core`と同じ固定バージョン。`bundled`でシステム依存無しに静的リンク）。
+
+3. **`AppScreen`に`Projects`を追加**:
+   ```rust
+   struct ProjectsScreen { projects: Vec<asr_core::store::projects::ProjectSummary>, error: Option<String> }
+   enum AppScreen { Projects(ProjectsScreen), Upload(UploadScreen), Editor(Entity<EditorLayoutDemo>) }
+   ```
+   `AppRoot`に`conn: Connection`を追加（`main()`で`app_db_path()`を`create_dir_all`した上で一度だけ`asr_core::store::open`）。`render()`は現行の「Upload以外はEditorのはず」という2分岐のelse-unreachableパターンをやめ、3方向の明示的な分岐に変更（各画面の描画を`render_projects`/既存のUpload本体/`Editor`委譲に分ける）。
+
+   一覧の各行は既存の話者パネル行と同じ見た目（ボーダー付き横並び、名前・日時・セグメント数）、末尾に「開く」ボタン。上部に常設の「新規作成」ボタン（`AppScreen::Upload(UploadScreen::default())`相当へ遷移）。「開く」は`store::projects::load_project`→`Transport::new(&media_path)`→（開けなければエラー表示、既存の「音声の読み込みに失敗しました」パスと同じ形）→`build_editor_entity`拡張版を呼んで`AppScreen::Editor`へ。
+
+4. **`EditorLayoutDemo`に永続化フィールドを追加**: `conn: Connection`（自分専用に同じDBファイルへ再オープン——`store::open`がWALモードにしているため複数コネクションの同時アクセスは安全）、`project_id: Option<String>`、`media_id: Option<String>`、`speaker_db_ids: HashMap<i32, String>`、`dirty: bool`。開発用ショートカット経由の場合は`project_id`/`media_id`を`None`にし、自動保存は常に`project_id.is_some()`をガードして無効化する。
+
+5. **`build_editor_entity`を拡張**——新しい保存先情報（`conn`, 既存プロジェクトなら`project_id`/`media_id`/`speaker_db_ids`、開発用ショートカットなら全部無し）を追加パラメータとして受け取るよう変更。呼び出し元3箇所（開発用ショートカット・アップロード完了後・プロジェクト再オープン後）がそれぞれ適切な値を渡す。
+
+6. **アップロード完了時（`start_pipeline`のポーリングループの`Next::Succeeded`分岐）**——`build_editor_entity`を呼ぶ前に`store::projects::create_project`→初回の`create_speakers`→初回の`save_segments`を実行し、その`project_id`/`media_id`/`speaker_db_ids`を新しい`EditorLayoutDemo`に持たせる。この時点の`conn`は`this: &mut AppRoot`が保持するもの（`AppRoot`と`EditorLayoutDemo`は別々にDBを開くので、ここでは一時的に`AppRoot.conn`を使って初回保存し、新しい`EditorLayoutDemo`は自分用に再オープンする）。
+
+7. **自動保存**——`build_editor_entity`の既存の200msタイマーとは別に、2秒間隔の`cx.spawn`タイマーを追加。`dirty`なら`sync_speaker_names`（統合で消えた話者は`delete_speaker`）→`save_segments`を実行し`dirty = false`、失敗したら`save_error: Option<String>`に記録してどこかに小さく表示（既存のステータス表示パターンを踏襲、大きなダイアログにはしない）。
+
+   `dirty = true`をセットする箇所を全て列挙する（既存コードの正確な行を基準に、漏れなく当てる）:
+   - `commit_focused`（本文コミット、:305）
+   - `split_focused_segment`（分割、:358-360）
+   - `merge_with_previous`（結合、:392-395）
+   - `assign_speaker`（Cmd+1..9、:405）
+   - `choose_row_speaker`（行ピッカー、:515）
+   - `confirm_merge`（話者統合、:554-561——`speaker_db_ids`から`from`のエントリを取り除いておく）
+   - 話者名の変更——専用のコミット関数が無く常時ライブバインドの`Textarea`なので、`render()`の「話者ごとにTextareaStateを用意する」ブロック（各speakerの`TextareaState`を`cx.new`する箇所）で`cx.observe(&state, |this, _, cx| { this.dirty = true; cx.notify(); })`を仕込む。
+
+**変更するファイル**: `crates/asr-core/src/store/projects.rs`（新規）、`crates/asr-core/src/store/mod.rs`（`pub mod projects;`）、`apps/desktop/Cargo.toml`（`rusqlite`追加）、`apps/desktop/src/bin/editor_layout_demo.rs`（`AppScreen::Projects`、`AppRoot.conn`、`EditorLayoutDemo`の永続化フィールド、`build_editor_entity`拡張、`start_pipeline`の保存呼び出し、自動保存タイマー、`main()`の起動分岐）。
+
+**(2) 用語パネルとの関係**: (2)は元々「`EditorLayoutDemo`にSQLite接続と`project_id`を追加する」という同じ配線を必要としていた。(1d)でこの配線が先に済むため、(2)の残りスコープは新しいstore関数群（`load_all_terms`等）とパネルUIのみに縮小される。
+
+**検証方法**: `cd apps/desktop && cargo +nightly build --bin editor-layout-demo` / `clippy --all-targets` の後、実機（ユーザー操作）で——(1) 起動直後にプロジェクト一覧が出るか（初回は空状態＋新規作成ボタン） (2) 新規作成→パイプライン完了後、一覧に戻ってから開くと同じ内容で再オープンできるか (3) 再オープン後に本文編集・話者名変更・分割・結合・話者割当・話者統合をそれぞれ行い、アプリを再起動してから開き直しても反映されているか (4) 開発用ショートカット（`[json_path] [media_path]`）が相変わらず一覧に出現しない（DBを汚染しない）か (5) メディアファイルを移動/削除した状態で「開く」を押した場合にエラー表示になりクラッシュしないか。
+
+**実装状況**: 実装済み。`crates/asr-core/src/store/projects.rs`（`list_projects`/`create_project`/`get_media_path`/`create_speakers`/`sync_speaker_names`/`delete_speaker`/`save_segments`/`load_project`、単体テスト`round_trips_a_project`込み）、`apps/desktop`（`app_db_path`/`open_app_db`、`AppScreen::Projects`＋一覧UI、`AppRoot.conn`、`EditorLayoutDemo`の`conn`/`project_id`/`media_id`/`speaker_db_ids`/`initial_speaker_names`/`dirty`/`save_error`フィールド、`ProjectContext`、`build_editor_entity`拡張、`persist`メソッド＋2秒間隔の自動保存タイマー、`open_upload`/`open_project`、`start_pipeline`成功時のプロジェクト作成、6箇所の`dirty=true`＋話者名`Textarea`への`cx.observe`）。
+
+`cargo build --workspace`/`clippy --workspace --all-targets`（asr-core側の新規テスト込み）、`cd apps/desktop && cargo +nightly build --bin editor-layout-demo`/`clippy --all-targets`とも警告・エラーゼロ。起動スモークテスト2パターン——(a) 引数無し→実際に`~/Library/Application Support/speaker-identification/app.db`が生成され、`sqlite3`で全テーブルのスキーマと`projects`が空であることを確認 (b) 開発用ショートカット（`[json_path] [media_path]`）実行後も同DBの`projects`件数が0のまま（DBを汚染しないという設計通り）——ともクラッシュ無し確認済み。
+
+**未検証（実機での操作が必要）**: 上記「検証方法」の(1)〜(5)全て——特に(2)(3)は実際にAPI課金を伴うパイプライン実行を経ないと確認できないため、ユーザー自身の操作が必要。
+
+---
+
+## 将来のタスク（未着手）
+
+### (2) 用語パネル
+
+**現状の制約（調査で判明）**: `crates/asr-core/src/terms/store.rs`の既存API（`load_terms`/`load_aliases`/`add_term`/`add_alias`）は追加専用——**削除・更新・IDでの参照が一切できない**。`load_terms`は`id`列を選択しておらず`Term`構造体自体にid フィールドが無い（`enabled=1`のフィルタも掛かっている）。`load_aliases`も同様にidを持たない（surface文字列同士の突合せのみ、`asr-cli`の一覧表示もこの制約に合わせてsurfaceマッチングしている）。パネルでの編集・削除には新しいstore関数が要る。
+
+**設計**:
+
+1. **`crates/asr-core/src/terms/store.rs`に追加**（既存の4関数の隣、`asr-core`がSQLiteを知る唯一の場所という規律を維持）:
+   ```rust
+   pub struct TermRow { pub id: String, pub term: Term }
+   pub fn load_all_terms(conn: &Connection, project_id: &str) -> Result<Vec<TermRow>>; // enabledフィルタ無し
+   pub fn update_term(conn: &Connection, id: &str, term: &Term) -> Result<()>;
+   pub fn delete_term(conn: &Connection, id: &str) -> Result<()>; // term_aliasesはON DELETE CASCADEで自動削除
+   pub fn set_enabled(conn: &Connection, id: &str, enabled: bool) -> Result<()>;
+   pub struct AliasRow { pub id: String, pub term_id: String, pub alias_surface: String }
+   pub fn load_all_aliases(conn: &Connection, project_id: &str) -> Result<Vec<AliasRow>>;
+   pub fn delete_alias(conn: &Connection, id: &str) -> Result<()>;
+   ```
+
+2. **`EditorLayoutDemo`にSQLite接続を追加**——(1)で発行された`project_id`と、`asr_core::store::open(&db_path)`で開いた`rusqlite::Connection`を保持する。話者パネルと同じ左カラムの縦積みに3枚目のパネルとして追加するか、右カラムの下に折りたたみ式で追加するか——検証用HTMLに参考レイアウトが無いため、話者パネルと同じ構造（一覧＋インラインの追加フォーム＋各行に有効/無効トグル・編集・削除ボタン）を踏襲する。
+
+3. **UI**: 話者パネルの`Textarea`常時編集パターンを流用——各用語行に`surface`/`reading_kana`用の2つの小さな`Textarea`、有効チェックボックス相当のトグル、削除ボタン。新規追加は下部に常設の空行フォーム（`surface`入力→Enter的な操作ではなく明示の「追加」ボタン、テキスト編集中の誤操作を避ける——このアプリ全体の「構造操作は明示的操作で」という一貫方針に合わせる）。
+
+**変更するファイル**: `crates/asr-core/src/terms/store.rs`（新規関数群）、`apps/desktop/src/bin/editor_layout_demo.rs`（用語パネルUI、SQLite接続の保持）。
+
+**検証方法**: 実データで用語を追加・編集・無効化・削除し、`asr-cli`側の`terms list`で同じDBを開いて整合性を確認。既存の3層用語補正（実行済みのパイプラインの結果には影響しない——補正は既にASR時点で適用済み、パネルでの変更は次回パイプライン実行から効く点をユーザーに明示）。
+
+---
+
+### (3) 書き出し機能
+
+**設計**: 純粋なデータ変換なので`asr-core`に新モジュールとして実装（UI非依存、CLIからも将来使える）:
+```rust
+// crates/asr-core/src/export/mod.rs
+pub fn to_plain_text(segments: &[TranscriptSegment], speaker_names: &HashMap<i32, String>) -> String;
+pub fn to_srt(segments: &[TranscriptSegment], speaker_names: &HashMap<i32, String>) -> String;
+pub fn to_vtt(segments: &[TranscriptSegment], speaker_names: &HashMap<i32, String>) -> String;
+pub fn to_markdown(segments: &[TranscriptSegment], speaker_names: &HashMap<i32, String>) -> String;
+```
+SRT/VTTはミリ秒→`HH:MM:SS,mmm`（SRT）/`HH:MM:SS.mmm`（VTT）変換が要る（`format_ms`は`mm:ss`までしか出さないので新しいフォーマッタが要る）。
+
+UI側: ツールバーに「書き出し」ボタン→話者パネルの`speaker_option_row`と同じ見た目のインラインピッカーで4形式から選択→`cx.prompt_for_new_path(default_dir, Some(default_filename))`で保存先を聞く（`App::prompt_for_new_path`、ネイティブ保存ダイアログ）→`std::fs::write`。話者名は`EditorLayoutDemo::speaker_name_states`から`speaker_label()`で解決してから`HashMap<i32,String>`に変換して渡す。
+
+**変更するファイル**: `crates/asr-core/src/export/mod.rs`（新規）、`crates/asr-core/src/lib.rs`（`pub mod export;`追加）、`apps/desktop/src/bin/editor_layout_demo.rs`（書き出しボタン・保存フロー）。
+
+**検証方法**: 実データで4形式それぞれ書き出し、SRT/VTTは実際に動画プレイヤー（QuickTime等）やブラウザで字幕として読み込んで表示崩れが無いか確認。
+
+---
+
+### (4) ループ再生UI
+
+**設計**: `asr_audio::LoopRegion { start_ms, end_ms }`は既存だが`Transport`は未対応（3bスパイクの`play_signalsmith`にはループ処理があったが、`Transport`実装時は意図的にスコープ外にした）。
+
+1. **`Transport`にループ対応を追加**（`crates/asr-audio/src/transport.rs`）: `set_loop_region(Option<LoopRegion>)`を追加し、`Shared`に`loop_region: Mutex<Option<LoopRegion>>`を持たせる。オーディオコールバック（`Transport::render`）で、ループ区間内かつ`pos`が`region.end_ms`相当のフレームに達したら`region.start_ms`相当のフレームへ巻き戻し、`stretch.reset()`を呼ぶ——3bスパイクの`play_signalsmith`で既に検証済みの継ぎ目防止パターンをそのまま踏襲。
+
+2. **UI操作**（ドラッグ選択はタイムラインの既存クリックシークと衝突しやすいため見送り、キーマップで設定する方式を採用）:
+   - `Cmd+Shift+[` — 現在の再生位置をループ開始点に設定
+   - `Cmd+Shift+]` — 現在の再生位置をループ終了点に設定
+   - `Cmd+Shift+L` — ループのON/OFF切り替え（開始・終了の両方が設定済みの場合のみ有効）
+   タイムラインに設定済みのループ区間を半透明の帯として表示（`speaker_timeline()`のcanvasに、プレイヘッドと同様の要領で追加描画）。
+
+**変更するファイル**: `crates/asr-audio/src/transport.rs`（ループ対応）、`apps/desktop/src/speaker_timeline.rs`（ループ区間の描画）、`apps/desktop/src/bin/editor_layout_demo.rs`（キーマップ・状態管理）。
+
+**検証方法**: 実データでループを設定し、区間の継ぎ目でノイズ/ポップ音が無いか耳で確認（3bスパイクと同水準の「多分大丈夫」確認）。
 
 ### Phase 4 — 任意（未着手）
 クラウド版（`apps/server`）、編集履歴からの用語自動学習、ローカルASRフォールバック（`whisper-rs`）。

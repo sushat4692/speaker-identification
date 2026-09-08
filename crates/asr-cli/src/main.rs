@@ -711,6 +711,7 @@ fn cmd_transcribe_pipeline(
         &terms_vec,
         language,
         pad_ms,
+        &mut |_done, _total| {}, // per-chunk tracing::info! inside the stage already covers this
     )
     .context("transcription stage failed")?;
     eprintln!(
