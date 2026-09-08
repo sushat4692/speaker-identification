@@ -37,6 +37,11 @@ rayon = "1"
 # --- storage ---
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# --- realtime playback (Phase 3b spike) ---
+cpal = "0.18"
+signalsmith-stretch = "0.1.3"
+timestretch = "0.15"
+
 # --- async / plumbing ---
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "sync", "time"] }
 anyhow = "1"

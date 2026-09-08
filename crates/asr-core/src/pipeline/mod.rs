@@ -33,7 +33,7 @@ pub struct DiarizationStageOutput {
     pub merged_segments: Vec<SpeakerSegment>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TranscriptSegment {
     pub speaker: i32,
     pub start_ms: u64,

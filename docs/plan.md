@@ -542,10 +542,22 @@ symphonia（デコード）
 
 文字起こし修正は「聞き取り → 打鍵 → 少し戻す」の高速ループなので、キーボード操作が生命線。
 
-**レイアウト**
-- 上部: 波形 + 話者を色分けした区間表示、プレイヘッド
-- 中央: セグメントの仮想スクロールリスト（話者ラベル / 時刻 / テキスト）。再生位置に追従してハイライト・自動スクロール
-- 右: 話者パネル（命名・統合・分割） / 用語パネル（登録・候補確認）
+**レイアウト（追記: `tools/diarization-viewer.html` の検証用レイアウトを正として採用）**
+
+当初案は「上部:波形、中央:リスト、右:パネル」という縦積みだったが、検証用HTMLツールの2カラムレイアウトの評判が良かったため、そちらを踏襲する:
+
+```
+[ツールバー: ファイル/プロジェクト操作]
+本体（横2カラム）
+  ├─ 左カラム（固定幅目安42%）: 動画/音声プレイヤー
+  └─ 右カラム（残り全部、縦積み）
+       ├─ タイムライン（横スクロール、話者色分け区間 + プレイヘッド）— 固定高さ、小さめ
+       ├─ 話者凡例（スウォッチ・リネーム・表示トグル）
+       └─ セグメントリスト（`flex:1`で残り全部、縦スクロール、話者ラベル/時刻/テキスト）
+            再生位置に追従してハイライト・自動スクロール。ヘッダはsticky。クリックでシーク
+```
+
+話者パネル・用語パネルは検証用HTMLには無かった要素——別タブ/オーバーレイにするか、右カラムをさらに分割するかは実装時に判断。
 
 ### キーボード — `Cmd` ベースに寄せる
 
@@ -679,7 +691,9 @@ N セグメントに N 個の `TextareaState`（`Rope` + undo manager を持つ�
   - `apps/desktop/rust-toolchain.toml` で `channel = "nightly"` を指定
   - `rustup toolchain install nightly` 実行済み
 
-  **一時的な誤診断とその訂正**: 最初にこの nightly 環境でビルドした際も同じ `E0658` エラーが出たため「nightly だけでは不十分で `RUSTC_BOOTSTRAP=1` が要る」と誤って判断した。しかし `target` を完全に削除してクリーンな状態から `cargo +nightly build` を実行し直したところ、`gpui-pre-util` は問題なくコンパイルされ、ビルド全体が成功した。誤診断の原因は、直前の失敗ログを `tail -150` で確認した際に実際に使われていた rustc バージョンの表示行を見落としていたこと（ワークスペース分離作業の途中で一時的に stale な状態を見ていた可能性が高い）。**結論: `RUSTC_BOOTSTRAP` は不要。nightly ツールチェーンを `apps/desktop` にスコープするだけで十分。**
+  **一時的な誤診断とその訂正**: 最初にこの nightly 環境でビルドした際も同じ `E0658` エラーが出たため「nightly だけでは不十分で `RUSTC_BOOTSTRAP=1` が要る」と誤って判断した。しかし `target` を完全に削除してクリーンな状態から `cargo +nightly build` を実行し直したところ、`gpui-pre-util` は問題なくコンパイルされ、ビルド全体が成功した。**結論: `RUSTC_BOOTSTRAP` は不要。nightly ツールチェーンを `apps/desktop` にスコープするだけで十分。**
+
+  > **根本原因が後日確定した**: このセッションの環境には `RUSTUP_TOOLCHAIN=1.92.0` という環境変数が設定されており、これが `apps/desktop/rust-toolchain.toml` によるnightly自動選択を毎回サイレントに上書きしていた（rustupの優先順位は 環境変数 > toolchainファイル > default）。`cargo +nightly build`（`+toolchain`は環境変数より優先される）を明示したときだけ本当にnightlyが使われていたため、「nightly単体では直らない」という一度目の誤診断も、後の「実は直る」という訂正も、**両方とも観測としては正しく、原因の特定だけが後回しになっていた**。**`apps/desktop` を触るときは常に `cargo +nightly ...` を明示すること**（`rust-toolchain.toml` の自動検出に任せない）。
 
   > 寄り道として、代替案も実測した。**`gpui-ce`**（Zed の gpui を外部消費者向けに再実装したコミュニティフォーク、1000+ stars、`cargo add gpui-ce` で使う設計）は実際に stable Rust で素直にビルドが通った（`gpui-pre` 系列に一切依存しない独立実装）。ただし `gpui-component`（Textarea 等の IME 対応済みウィジェット）は `gpui-pre` にしか対応しておらず、`gpui-ce` と組み合わせられない。また、ユーザーの別プロジェクト（Streaid）が `gpui = "0.2.2"`（素の公式crate）+ `gpui-component = "0.5.1"` で問題なく動いていることも確認した——`gpui-component` は 0.5.1 から 0.6.0 の間のどこかで依存先を素の `gpui 0.2.2` から `gpui-pre` 系列に切り替えており、これが両者の違いの直接の原因だった。今回は最終的に nightly スコープで `gpui-kit 0.6` / `gpui-component 0.6.0` をそのまま使う方針を継続した（最新の実装 + 解決済みの IME 対応を両取りできるため）。
 
@@ -690,11 +704,106 @@ N セグメントに N 個の `TextareaState`（`Rope` + undo manager を持つ�
 - **3b. 再生エンジンスパイク（3〜4日）**
   `cpal` + `signalsmith-stretch` と `timestretch` を**実際の日本語音声**で 0.5×/0.75×/1.0×/1.5×/2.0× A/B する。レイテンシ補正後のプレイヘッド精度と、ループ継ぎ目のクリーンさを確認。
 
+  #### 3b 実測結果 — go 判定
+
+  `crates/asr-audio/src/bin/playback_spike.rs` を実装。`signalsmith-stretch`（`Stretch::process()`を cpal コールバックごとに呼ぶリアルタイム経路、ループ境界での`reset()`、`output_latency()`補正済みプレイヘッドのコンソール表示）と、`timestretch`（リアルタイムAPIが無い純オフライン変換——全体を`stretch()`で一括変換してから単純再生、あくまで音質A/B用で本番採用はしない）の両方を実データ（`debug-data/recall_test/recall_test.wav`）で動作確認。
+
+  自己テストでは1.0倍速でのリアルタイム再生・ループ境界での巻き戻し・`timestretch`のオフライン変換が正しく動くことを確認（コールバックが`finished`後も空処理を繰り返しループ回数カウンタが暴走する小さなバグを発見・修正済み）。
+
+  **人手による0.5×〜2.0×のA/B自体は、3aのIME検証ほど網羅的なチェックリスト消化ではなく「多分大丈夫」という軽めの確認だった。** 3aとは異なり項目ごとの明示的な合否は取っていない。**→ go とみなして本実装に進むが、後続の作業で違和感があれば再度ここに戻って比較する。**
+
 その後に本実装:
-- 波形 `Element`（ピークピラミッド + 話者色）
-- セグメントリスト（`list()`/`ListState` + フォーカス行入れ替えパターン、`overdraw` 調整）
+- ~~波形 `Element`（ピークピラミッド + 話者色）~~ → **波形（振幅）自体は不要と判断、話者色分けタイムラインのみ実装（下記）**
+- セグメントリスト（`list()`/`ListState` + フォーカス行入れ替えパターン、`overdraw` 調整）← **読み取り専用の第一弾を実装済み（下記）。フォーカス行入れ替えでの編集は未着手**
 - 話者パネル / 用語パネル、`Cmd` ベースのキーマップ
 - 書き出し（テキスト / SRT / VTT / Markdown）
+
+#### 話者色分けタイムライン（追記、波形から差し替え）
+
+最初に `apps/desktop/src/waveform.rs` としてピークピラミッド（振幅）ベースの波形を実装したが、**ユーザー判断で振幅波形そのものは不要**と分かった。実際の修正作業（テキストを直す）に必須なのはセグメントリスト側であり、波形は元々「シーク/プレイヘッドの視覚的手がかり」「話者色分けでの全体俯瞰」という補助目的でしかなかった——後者（話者色分け）だけ欲しい、単色ブロックで良い、という結論になったため、`waveform.rs`/`waveform_demo.rs` を削除し `apps/desktop/src/speaker_timeline.rs` に差し替えた。
+
+**実装**: `asr_core::pipeline::TranscriptSegment`（`speaker: i32, start_ms, end_ms, text`。`Deserialize` を追加して実データJSONから読めるようにした）のリストと総尺を受け取り、時間軸に比例した位置に話者ごとの単色矩形を並べるだけ。ピークピラミッドは使わない。
+
+**Element実装の知見（波形の時に確認済み、そのまま流用）**: フルの `Element` トレイトを自前実装する必要はない — `gpui-pre` の `canvas(prepaint_fn, paint_fn) -> Canvas<T>`（`Styled` 実装済み、`gpui-pre-0.3.4/src/elements/canvas.rs`）で低レベル描画だけ書けば済む。矩形描画は `window.paint_quad(fill(bounds, color))`。`Bounds<Pixels>` の `Pixels` は内部 `pub(crate) f32` なので `f32::from(pixels)` で変換する。色は `Hsla { h, s, l, a }`（自由関数 `hsla()` は無く、フィールドが `pub` なので構造体リテラルで直接組み立てる）。
+
+`apps/desktop/src/bin/speaker_timeline_demo.rs` で実データ（`debug-data/pipeline_transcript.json`、実際の230秒クリップの本番パイプライン出力——51セグメント・5話者）を読み込んで描画するデモを作成・起動確認済み（後に `editor_layout_demo.rs` に統合、下記）。
+
+#### セグメントリスト 第一弾 + 2カラムレイアウトの実装（追記）
+
+`apps/desktop/src/segment_list.rs` として実装。**編集（フォーカス行入れ替えパターン）は次段階——今回は読み取り専用の行（話者ラベル/開始時刻/テキスト）まで。**
+
+**`list()`/`ListState` の実API**（`gpui-pre-0.3.4/src/elements/list.rs` で確認）: `ListState::new(item_count, alignment: ListAlignment, overdraw: Pixels)` を自分のビュー構造体に保持し、`list(state, render_item)` の `render_item` は `FnMut(usize, &mut Window, &mut App) -> AnyElement` — 日本語テキストの折り返しで行高が変わっても問題ない可変高対応（計画通り `uniform_list` は使っていない）。セグメントデータは `Rc<Vec<TranscriptSegment>>` としてクロージャにキャプチャさせている（`ListState` 自体はデータを持たない、レイアウト計算用の中間状態のみ）。
+
+**2カラムレイアウトへの差し替え**: 直前まで「上部:タイムライン、下:リスト」の縦積みだけで進めていたが、ユーザーから「検証用HTML（`tools/diarization-viewer.html`）のレイアウトが良かったので参考にしてほしい」との指摘があり、実際のCSSを読み直して**左カラム(42%幅): プレイヤー / 右カラム: タイムライン(固定高) + セグメントリスト(flex:1)**という2カラム構成に修正した（本セクション冒頭の「レイアウト」項目も更新済み）。`apps/desktop/src/bin/editor_layout_demo.rs` としてこの構成を実装——プレイヤーはまだプレースホルダー（asr-audioの再生統合は別タスク）。
+
+実データ（同じ230秒クリップ・51セグメント）で起動確認済み、`cargo +nightly clippy --all-targets` も無警告。話者パネル/用語パネルは検証用HTMLに無かった要素なので、実装時に別途配置を判断する。
+
+**テキストの折り返し（追記）**: 長いセグメントのテキストがタイムスタンプ列を押し込み、かつ見切れる問題をユーザーが発見。`.whitespace_normal()`（既定は `Nowrap` 相当）をテキスト列にのみ適用し、併せて `min_w(px(0.0))` を指定（flexアイテムは既定で `min-width: auto` になり、内容の幅より縮まない・折り返さないという定番の詰まりがあるため）。話者/時刻列は `flex_none()` で幅固定のまま維持。
+
+#### 行編集パターン（フォーカス行入れ替え）— 前例なしと判定していたものを実装・検証（追記）
+
+計画時点で「⚠️ この行入れ替え時のフォーカス／IME再接続はGPUIでの前例が確認できなかった。最初にスパイクで潰す対象」と明記していたパターンを、`editor_layout_demo.rs` 内で実装した（独立した専用スパイクではなく、動いているセグメントリストに直接組み込む形）。
+
+**設計**: `EditorLayoutDemo`（ビュー本体）が `segments: Vec<TranscriptSegment>`・`focused_row: Option<usize>`・`editor: Option<Entity<TextareaState>>` を直接保持。非フォーカス行はクリックハンドラ付きの静的テキスト、フォーカス行だけ実際の `Textarea` — 計画通り「N個の`TextareaState`を同時に作らない」設計になっている。
+
+**詰まった点とその解決**（実ソースで都度確認）:
+- `on_click` は `Div` ではなく `Stateful<Div>` にしか生えていない（`StatefulInteractiveElement: InteractiveElement` トレイト）。`.id(("segment-row", ix))` で先に `Stateful<Div>` に変換してから `.on_click(...)` を呼ぶ必要がある
+- クリックハンドラ（`Fn(&ClickEvent, &mut Window, &mut App)`）から**自分のビューを更新する**には、`render()` 内で `cx.weak_entity()` を取得してクロージャにキャプチャし、ハンドラの中で `weak.upgrade()` → `entity.update(cx, |this, cx| {...})` する（`Entity<T>::update` は `cx: &mut C where C: AppContext` を取るので `&mut App` から直接呼べる）。GPUIの標準的なコールバック→エンティティ更新の作法で、想定通り機能した
+- 新しい `TextareaState` の作成時、既存テキストを流し込むのは `state.set_value(text, window, cx)`（undo履歴を汚さない専用メソッドが用意されている）。読み出しは `state.text()`（`&Rope`）→ `.to_string()`
+- if/elseの両分岐で異なる具象型（`Div` vs `Stateful<Div>`）を返すと型エラーになるため、各分岐の中でそれぞれ `.into_any_element()` してから返す必要がある
+
+**コミットのタイミング**: 現状は「別の行をクリックした瞬間」にのみ編集内容を確定する（`focus_row` が呼ばれた時に前の編集を書き戻す）。Enter確定・Esc取消・クリックアウト（リスト外クリック）での確定はまだ未実装——将来のキーマップ実装（`Cmd`ベース、計画の「キーボード」節）と合わせて追加する。
+
+**ビルド・起動は確認済み（`cargo +nightly clippy --all-targets` 無警告）だが、実際にクリックして入力・IME変換・行の切り替えが問題なく動くかはユーザーによる手動確認が必要**——ここが本来「前例がない」と警戒していた核心部分なので、3aのIME検証と同様、実機での動作確認が欠かせない。
+
+**→ ユーザーが実機確認し、動作は問題なし。ただし見た目の改善要望が2点あった（下記）。**
+
+#### 行編集の見た目の改善（実装済み）
+
+## Context
+
+実機確認の結果、行編集そのもの（クリックでの切り替え・IME入力）は問題なかったが、見た目に2つの問題が見つかった:
+
+1. **編集中のTextareaが背景白・テキストがグレーで視認性が非常に悪い**。原因は、アプリがダークテーマを明示的に有効化していないこと。`gpui-component` はテーマを明示しない限り既定でライトテーマになっており、我々の自前の黒背景UI（`bg(rgb(0x1e1e1e))` を各所で指定）の中に、テーマ由来のライトな `Textarea` だけが浮いて見える状態になっている。
+2. **Textareaの高さが固定で、内容に応じて自動的に伸び縮みしない**。
+
+いずれもピンポイントな修正で、`gpui-component-0.6.0` のソースで実際に該当APIを確認済み:
+
+- **ダークテーマ**: `gpui_component::Theme::change(ThemeMode::Dark, None, cx)`（`gpui-component-0.6.0/src/theme/mod.rs`）を `gpui_kit::init(cx)` の直後に一度呼ぶだけでよい。テストコード内の実例（`init(cx); Theme::change(ThemeMode::Dark, None, cx);` という順序）で確認済み。個々のウィジェットに背景色を都度指定するより、テーマを揃える方が今後増えるコンポーネントにも一貫して効く。
+- **自動高さ**: `InputBaseState<TextareaMode>` に `pub fn auto_grow(mut self, min_rows: usize, max_rows: usize) -> Self`（`gpui-base-0.6.0/src/input/base/state.rs:5222`）というビルダーメソッドが用意されている。`TextareaState::new(window, cx)` の直後に `.auto_grow(1, 20)` のように連結するだけ（`min_rows`〜`max_rows`の行数の範囲で内容に応じて伸びる）。
+
+## 変更するファイル
+
+- `apps/desktop/src/bin/editor_layout_demo.rs`
+  - `main()` 内、`gpui_kit::init(cx);` の直後に `gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);` を追加
+  - `focus_row()` 内、`TextareaState::new(window, cx)` を `TextareaState::new(window, cx).auto_grow(1, 20)` に変更（`min_rows=1, max_rows=20` — セグメントは長くても数行程度なので余裕を持たせる）
+- `apps/desktop/src/bin/ime_spike.rs`
+  - 同じ根本原因（ダークテーマ未設定）が影響しているはずなので、一貫性のため同様に `Theme::change` を追加（任意だが安価な修正）
+
+## 検証方法
+
+`cd apps/desktop && cargo +nightly build --bin editor-layout-demo` でビルドし、既存プロセスを再起動して実機で見た目を確認してもらう。`cargo +nightly clippy --all-targets` も併せて確認。
+
+**実装結果**: 上記2点を実装・確認（ダークテーマ、自動高さ）。ユーザーから追加で2点の指摘があり、同じ実装セッション内で追って修正した:
+
+1. **クリックでTextareaに切り替わってもフォーカスが当たっていない**（もう一度クリックしないと入力できない）。`InputBaseState::focus(&self, window, cx)`（`gpui-base-0.6.0/src/input/base/state.rs:1184`、内部で`focus_handle.focus(window, cx)`を呼ぶ）を、`focus_row()`内で新しい`TextareaState`を`cx.new(|cx| {...})`する際に`set_value`の直後で呼ぶだけで解決——エンティティ生成クロージャの`cx`はそのエンティティ自身の`Context<Self>`なので、`state.focus(window, cx)`をそのまま呼べる。
+2. **Textareaのフォントサイズが静的テキストより小さい**。原因は`gpui-component-0.6.0/src/sizing.rs`の`StyleSized::input_text_size()`——`Size::Medium`（Textareaの既定）が`.text_sm()`にマップされており、静的な`div()`テキストより小さい。個々のウィジェットの既定サイズに依存せず**両方に同じ明示的な`.text_size(px(14.0))`を指定**（`ROW_TEXT_SIZE`定数）して解決。`Textarea`は`Styled`を実装しているので`.text_size(...)`をそのままチェーンできる。
+
+両方とも`cargo +nightly clippy --all-targets`無警告、実機で動作確認済み。
+
+**追加修正: フォーカス時のカーソル位置を末尾にする**。`set_value()`のドキュメントに明記されている通り「複数行入力では選択範囲を`0..0`にリセットする」仕様のため、フォーカス直後はカーソルが先頭に来ていた。`InputBaseState`には`move_to_end`相当の直接呼べるpublicメソッドが無い（`movement.rs`の`move_to`/`move_to_end`はいずれも`pub(crate)`）ため、public APIの`set_cursor_position(position: impl Into<Position>, window, cx)`（内部で`focus`も呼ぶ）を使い、`RopeExt::offset_to_position(...)`で「テキスト末尾」のPositionを計算して渡す形で解決した。`RopeExt`は`gpui_component::input`から再エクスポートされている。
+
+> **一度目の実装は日本語で末尾にならないバグを持っていた**（ユーザーが実機確認で指摘、「マルチバイトが原因では」という指摘も的中）。`offset_to_position(offset)`の`offset`は**バイトオフセット**（実装は`line_to_byte_idx`/`char_to_byte_idx`を使用）だが、最初`ropey::Rope::len_chars()`（**文字数**）を渡していた。UTF-8で1文字3バイトの日本語では、文字数はバイト数のおよそ1/3——結果、カーソルは末尾ではなく本文の途中（およそ1/3の位置）に置かれていた。`Rope::len()`（バイト長、ropeyのドキュメントに明記）に修正して解決。
+
+**追加修正: フォーカスすると行の高さが変わる**。
+
+一度目の対応（`.p_0()`をTextareaに追加）は**効果が無かった**——ユーザーの実機確認で判明。原因を`gpui-component-0.6.0/src/input/input.rs`で再確認すると、複数行入力（`is_multi_line()`）のpaddingは`Styled`の`refine_style`チェーンとは**別経路**で決まっていた: `Input::render()`が毎フレーム`state.set_editor_paddings(Edges { top: self.size.input_py(), ..., left: self.size.input_px(), ... }, cx)`を無条件に呼び、`self.size`（既定`Size::Medium`）に基づく固定paddingを**状態オブジェクトに直接**書き込んでいる。`input_px()`/`input_py()`は`Size::Medium`で各8px（`sizing.rs`）。この経路は外側の`Styled`チェーン（`.p_0()`等）が一切届かない——加えて`Textarea`自体（`textarea.rs`の構造体）は`Size`を変更する公開ビルダーメソッドを持たない（`Sizable`未実装）ため、**Textarea側の固定paddingを消す・上書きする手段が公開APIには存在しない**。
+
+方針を反転し、**静的テキスト側にTextareaの固定padding（上下8pxずつ）と同じ量を追加**することで揃えた（`editor_layout_demo.rs`の静的テキストdivに`.py(px(8.0))`を追加）。行全体の高さは、編集/非編集どちらの状態でも同じ量のpaddingを持つことで安定する。
+
+> **これでも高さが一致しなかった**（ユーザー確認: 「テキストエリアの方が行が狭くなった」）。原因は padding だけでなく、`Input::render()`が`.line_height(LINE_HEIGHT)`（`LINE_HEIGHT: Rems = Rems(1.25)`、`input.rs:369`）も自前で設定しており、静的テキスト側は line-height を明示していなかった（既定値のまま）ため、行の実高さがズレていたと判明。併せて水平方向（`input_px(Size::Medium) = 10px`）も揃っていなかった（ユーザーから追加指摘）。静的テキストdivに`.px(px(10.0))`と`.line_height(Rems(1.25))`を追加して両方揃えた。
+
+> **それでもごくわずかにズレた**（ユーザー確認・「border分かも」という指摘も的中）。`Input`は既定で`appearance(true)`かつ`bordered(true)`のため`.border_1()`（1px枠線）が自前で付いており、枠線を持たない静的テキスト側との間にpx単位の非対称が残っていた。border付きの静的テキスト版を作るより、**`Textarea::new(&state).appearance(false)`でTextarea側の枠線・背景ごと消す**方を選んだ（ドキュメント通り「appearance=falseでborder/backgroundなし」になる）——今回のゴールは「行を編集モードでも同じ見た目にする」ことなので、装飾を足すより引く方が筋が良い。
 
 ### Phase 4 — 任意
 - クラウド版（`apps/server`）

@@ -11,7 +11,17 @@ publish = false
 [dependencies]
 gpui-kit = "0.6"
 anyhow = "1"
+asr-core = { path = "../../crates/asr-core" }
+serde_json = "1"
 
 [[bin]]
 name = "ime-spike"
 path = "src/bin/ime_spike.rs"
+
+[[bin]]
+name = "speaker-timeline-demo"
+path = "src/bin/speaker_timeline_demo.rs"
+
+[[bin]]
+name = "editor-layout-demo"
+path = "src/bin/editor_layout_demo.rs"

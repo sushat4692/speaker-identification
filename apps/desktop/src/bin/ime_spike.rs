@@ -35,6 +35,7 @@ impl Render for ImeSpike {
 fn main() {
     gpui_kit::application().run(|cx| {
         gpui_kit::init(cx);
+        gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), |window, cx| {
                 let view = cx.new(|cx| ImeSpike::new(window, cx));

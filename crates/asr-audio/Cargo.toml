@@ -11,3 +11,12 @@ description = "Realtime playback transport: seek, loop region, pitch-preserving 
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+asr-core = { path = "../asr-core" }
+cpal.workspace = true
+signalsmith-stretch.workspace = true
+timestretch.workspace = true
+clap.workspace = true
+
+[[bin]]
+name = "playback-spike"
+path = "src/bin/playback_spike.rs"
