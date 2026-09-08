@@ -3,7 +3,9 @@
 //! amplitude-waveform attempt — the user decided the waveform itself wasn't
 //! worth building, just the speaker coloring.
 
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use asr_core::pipeline::TranscriptSegment;
 use gpui_kit::component::Root;
@@ -18,11 +20,22 @@ struct TimelineDemo {
 
 impl Render for TimelineDemo {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // `speaker_timeline` grew a zoom/playhead/click-seek API for the
+        // real editor (see docs/plan.md's timeline section) -- this
+        // standalone demo predates that and has no transport, so it just
+        // picks a fixed zoom and a no-op bounds sink.
+        let pixels_per_second = 40.0;
         div()
             .size_full()
             .p_4()
             .bg(rgb(0x1e1e1e))
-            .child(speaker_timeline(self.segments.clone(), self.total_duration_ms))
+            .child(speaker_timeline(
+                self.segments.clone(),
+                self.total_duration_ms,
+                pixels_per_second,
+                0,
+                Rc::new(Cell::new(Bounds::default())),
+            ))
     }
 }
 

@@ -3,39 +3,123 @@
 //! when" overview from docs/plan.md's editor layout ("上部: 波形 + 話者を
 //! 色分けした区間表示"). No waveform/amplitude rendering: the user decided
 //! that wasn't worth building — solid speaker-colored blocks are enough.
+//!
+//! Extended per docs/plan.md's "タイムラインの強化" section to also carry a
+//! playhead line and report its own painted bounds back out via
+//! `painted_bounds` — the canvas element itself can't receive mouse events
+//! (no `InteractiveElement` impl), so the click-to-seek handler lives on the
+//! wrapping div in `editor_layout_demo.rs` and needs this to convert a click
+//! position into a timestamp.
+
+use std::cell::Cell;
+use std::rc::Rc;
 
 use asr_core::pipeline::TranscriptSegment;
-use gpui_kit::{canvas, fill, point, size, Bounds, Hsla, IntoElement, Pixels, Styled as _};
+use gpui_kit::{Bounds, Hsla, IntoElement, ParentElement as _, Pixels, Styled as _, *};
+
+use crate::segment_list::format_ms;
 
 /// Cycles through a fixed palette by `speaker % palette.len()`. Good enough
-/// until real speaker enrollment/naming assigns stable identities.
-fn speaker_color(speaker: i32) -> Hsla {
+/// until real speaker enrollment/naming assigns stable identities. `pub` so
+/// the speaker panel's swatches (`editor_layout_demo.rs`) match the
+/// timeline's own colors.
+pub fn speaker_color(speaker: i32) -> Hsla {
     const PALETTE: [f32; 8] = [0.0, 0.11, 0.22, 0.33, 0.55, 0.66, 0.77, 0.88]; // hues around the wheel
     let hue = PALETTE[(speaker.rem_euclid(PALETTE.len() as i32)) as usize];
     Hsla { h: hue, s: 0.55, l: 0.55, a: 1.0 }
 }
 
-/// Renders `segments` as colored blocks spanning `total_duration_ms`, filling
-/// whatever bounds the caller sizes it to (chain `.w_full().h(px(_))`).
-pub fn speaker_timeline(segments: Vec<TranscriptSegment>, total_duration_ms: u64) -> impl IntoElement {
+/// Content width for `total_duration_ms` at `pixels_per_second` — shared by
+/// the ruler and the canvas so they always agree on the coordinate space.
+pub fn timeline_content_width(total_duration_ms: u64, pixels_per_second: f32) -> Pixels {
+    px((total_duration_ms as f32 / 1000.0 * pixels_per_second).max(1.0))
+}
+
+/// Renders `segments` as colored blocks plus a playhead line, sized to the
+/// FULL recording length at `pixels_per_second` (not clamped to the
+/// viewport) — this must live inside a horizontally scrolling container
+/// (see `editor_layout_demo.rs`'s timeline row).
+///
+/// Writes its own painted `Bounds` into `painted_bounds` on every paint, so
+/// a mouse-down handler on the wrapping div can recover the on-screen
+/// x-origin needed for click-to-seek. This is already scroll-corrected: GPUI
+/// applies scroll offset by shifting element bounds during prepaint, so no
+/// separate scroll-offset arithmetic is needed at the click site.
+pub fn speaker_timeline(
+    segments: Vec<TranscriptSegment>,
+    total_duration_ms: u64,
+    pixels_per_second: f32,
+    playhead_ms: u64,
+    painted_bounds: Rc<Cell<Bounds<Pixels>>>,
+) -> impl IntoElement {
     canvas(
         move |bounds: Bounds<Pixels>, _window, _cx| bounds,
         move |bounds: Bounds<Pixels>, _prepaint_bounds, window, _cx| {
-            let width_px = f32::from(bounds.size.width).max(1.0);
+            painted_bounds.set(bounds);
             let height_px = f32::from(bounds.size.height).max(1.0);
-            let total_ms = total_duration_ms.max(1) as f32;
 
             for seg in &segments {
-                let start_x = (seg.start_ms as f32 / total_ms) * width_px;
-                let end_x = (seg.end_ms as f32 / total_ms) * width_px;
+                let start_x = seg.start_ms as f32 / 1000.0 * pixels_per_second;
+                let end_x = seg.end_ms as f32 / 1000.0 * pixels_per_second;
                 let block_bounds = Bounds {
-                    origin: point(bounds.origin.x + gpui_kit::px(start_x), bounds.origin.y),
-                    size: size(gpui_kit::px((end_x - start_x).max(1.0)), gpui_kit::px(height_px)),
+                    origin: point(bounds.origin.x + px(start_x), bounds.origin.y),
+                    size: size(px((end_x - start_x).max(1.0)), px(height_px)),
                 };
                 window.paint_quad(fill(block_bounds, speaker_color(seg.speaker)));
             }
+
+            // Painted last so it's always on top of the speaker blocks.
+            let playhead_x = playhead_ms as f32 / 1000.0 * pixels_per_second;
+            let playhead_bounds = Bounds {
+                origin: point(bounds.origin.x + px(playhead_x), bounds.origin.y),
+                size: size(px(2.0), px(height_px)),
+            };
+            window.paint_quad(fill(playhead_bounds, rgb(0xffffff)));
         },
     )
-    .w_full()
+    .flex_none()
+    .w(timeline_content_width(total_duration_ms, pixels_per_second))
     .h_full()
+}
+
+/// "Nice" tick interval (seconds) that stays at least `target_px` wide at
+/// the given zoom — ported from `tools/diarization-viewer.html`'s
+/// `niceTickInterval`, so ruler labels never crowd at any zoom level.
+fn nice_tick_interval_secs(target_px: f32, pixels_per_second: f32) -> u64 {
+    const NICE_SECONDS: [u64; 13] = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
+    NICE_SECONDS
+        .into_iter()
+        .find(|&secs| secs as f32 * pixels_per_second >= target_px)
+        .unwrap_or(*NICE_SECONDS.last().unwrap())
+}
+
+/// Time-ruler row: absolutely-positioned tick labels sharing the timeline
+/// canvas's coordinate space (`x = seconds * pixels_per_second`), so they
+/// scroll and zoom in lockstep with the segment blocks. 70px is the target
+/// label spacing from the reference HTML.
+pub fn timeline_ruler(total_duration_ms: u64, pixels_per_second: f32) -> impl IntoElement {
+    let tick_sec = nice_tick_interval_secs(70.0, pixels_per_second);
+    let total_secs = total_duration_ms / 1000;
+
+    let mut row = div()
+        .relative()
+        .flex_none()
+        .w(timeline_content_width(total_duration_ms, pixels_per_second))
+        .h(px(18.0));
+
+    let mut t = 0u64;
+    while t <= total_secs {
+        let tick_x = t as f32 * pixels_per_second;
+        row = row.child(
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(tick_x))
+                .text_size(px(10.0))
+                .text_color(rgb(0x9a9ba0))
+                .child(format_ms(t * 1000)),
+        );
+        t += tick_sec;
+    }
+    row
 }

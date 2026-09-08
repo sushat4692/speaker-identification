@@ -12,6 +12,7 @@ publish = false
 gpui-kit = "0.6"
 anyhow = "1"
 asr-core = { path = "../../crates/asr-core" }
+asr-audio = { path = "../../crates/asr-audio" }
 serde_json = "1"
 
 [[bin]]
