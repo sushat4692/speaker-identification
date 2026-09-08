@@ -94,8 +94,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS term_aliases (
             id           TEXT PRIMARY KEY,
             term_id      TEXT NOT NULL REFERENCES terms(id) ON DELETE CASCADE,
-            surface      TEXT NOT NULL,
-            reading_kana TEXT
+            surface      TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS corrections (

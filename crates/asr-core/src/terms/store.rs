@@ -64,12 +64,15 @@ pub fn add_term(conn: &Connection, project_id: &str, term: &Term) -> Result<Stri
 
 /// Register a known alternate surface form for an existing term — e.g. an
 /// English-script rendering an ASR provider might produce (see the plan
-/// doc's "クラウドゲート問題").
-pub fn add_alias(conn: &Connection, term_id: &str, alias_surface: &str, reading_kana: Option<&str>) -> Result<()> {
+/// doc's "クラウドゲート問題"). No reading is stored for the alias itself:
+/// an alias is a known-*wrong* literal string being replaced outright
+/// (`apply_alias_corrections` matches on surface only), not something
+/// with a "correct" reading of its own.
+pub fn add_alias(conn: &Connection, term_id: &str, alias_surface: &str) -> Result<()> {
     let id = uuid::Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO term_aliases (id, term_id, surface, reading_kana) VALUES (?1, ?2, ?3, ?4)",
-        params![id, term_id, alias_surface, reading_kana],
+        "INSERT INTO term_aliases (id, term_id, surface) VALUES (?1, ?2, ?3)",
+        params![id, term_id, alias_surface],
     )?;
     Ok(())
 }
@@ -97,7 +100,7 @@ mod tests {
             },
         )
         .unwrap();
-        add_alias(&conn, &term_id, "Cloud Gate", None).unwrap();
+        add_alias(&conn, &term_id, "Cloud Gate").unwrap();
 
         let terms = load_terms(&conn, "p1").unwrap();
         assert_eq!(terms.len(), 1);
@@ -127,7 +130,7 @@ mod tests {
             },
         )
         .unwrap();
-        add_alias(&conn, &term_id, "disabled alias", None).unwrap();
+        add_alias(&conn, &term_id, "disabled alias").unwrap();
 
         assert!(load_terms(&conn, "p1").unwrap().is_empty());
         assert!(load_aliases(&conn, "p1").unwrap().is_empty());

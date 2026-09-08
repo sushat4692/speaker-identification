@@ -778,7 +778,7 @@ fn cmd_terms(action: TermsAction) -> Result<()> {
             .context("adding term")?;
 
             for alias in &aliases {
-                terms_store::add_alias(&conn, &term_id, alias, None).context("adding alias")?;
+                terms_store::add_alias(&conn, &term_id, alias).context("adding alias")?;
             }
 
             println!("registered term '{surface}' (id={term_id}) with {} alias(es)", aliases.len());
