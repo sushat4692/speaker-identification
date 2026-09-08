@@ -46,6 +46,16 @@ enum Command {
         cluster_threshold: f32,
         #[arg(long)]
         num_speakers: Option<i32>,
+        /// Minimum accepted speech-segment duration, in seconds. Segments
+        /// shorter than this are dropped by the segmentation model before
+        /// clustering ever sees them — lowering it is the lever for
+        /// short-utterance ("aizuchi") missed-detection, per the plan doc's
+        /// finding that missed detection (not confusion) dominates DER once
+        /// cluster_threshold is tuned.
+        #[arg(long, default_value_t = 0.3)]
+        min_duration_on: f32,
+        #[arg(long, default_value_t = 0.5)]
+        min_duration_off: f32,
         #[arg(long, default_value_t = 500)]
         max_gap_ms: u64,
         #[arg(long, default_value_t = 60_000)]
@@ -148,6 +158,8 @@ fn main() -> Result<()> {
             models_dir,
             cluster_threshold,
             num_speakers,
+            min_duration_on,
+            min_duration_off,
             max_gap_ms,
             max_merged_ms,
             format,
@@ -157,6 +169,8 @@ fn main() -> Result<()> {
             &models_dir,
             cluster_threshold,
             num_speakers,
+            min_duration_on,
+            min_duration_off,
             max_gap_ms,
             max_merged_ms,
             format,
@@ -216,6 +230,8 @@ fn cmd_diarize(
     models_dir: &std::path::Path,
     cluster_threshold: f32,
     num_speakers: Option<i32>,
+    min_duration_on: f32,
+    min_duration_off: f32,
     max_gap_ms: u64,
     max_merged_ms: u64,
     format: OutputFormat,
@@ -225,6 +241,8 @@ fn cmd_diarize(
     let params = DiarizeParams {
         cluster_threshold,
         num_speakers,
+        min_duration_on,
+        min_duration_off,
         ..Default::default()
     };
 
