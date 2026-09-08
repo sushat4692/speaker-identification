@@ -133,6 +133,49 @@ enum Command {
         #[arg(long, default_value_t = 60_000)]
         max_merged_ms: u64,
     },
+
+    /// Transcribe one audio file (typically a single already-diarized
+    /// chunk) via ElevenLabs Scribe v2. Reads the API key from an
+    /// environment variable, never a CLI arg, so it can't end up in shell
+    /// history or a process list.
+    Transcribe {
+        media: PathBuf,
+        #[arg(long, default_value = "ja")]
+        language: String,
+        #[arg(long, default_value = "ELEVENLABS_API_KEY")]
+        api_key_env: String,
+        /// Comma-separated registered terms to bias toward (keyterms).
+        #[arg(long)]
+        terms: Option<String>,
+    },
+
+    /// Full pipeline, first real end-to-end run: diarize -> merge ->
+    /// pad into chunks -> ElevenLabs per chunk -> trim overlap. One
+    /// sequential request per diarized segment (see
+    /// asr_core::pipeline::run_transcription_stage for why sequential).
+    TranscribePipeline {
+        media: PathBuf,
+        #[arg(long, default_value = "models")]
+        models_dir: PathBuf,
+        #[arg(long, default_value_t = 0.9)]
+        cluster_threshold: f32,
+        #[arg(long, default_value_t = 500)]
+        max_gap_ms: u64,
+        #[arg(long, default_value_t = 60_000)]
+        max_merged_ms: u64,
+        /// Real-audio context padding on each side of a chunk, per the
+        /// plan's short-chunk mitigation.
+        #[arg(long, default_value_t = 300)]
+        pad_ms: u64,
+        #[arg(long, default_value = "ja")]
+        language: String,
+        #[arg(long, default_value = "ELEVENLABS_API_KEY")]
+        api_key_env: String,
+        #[arg(long)]
+        terms: Option<String>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -187,6 +230,32 @@ fn main() -> Result<()> {
         Command::Serve { cache, port, max_gap_ms, max_merged_ms } => {
             cmd_serve(&cache, port, max_gap_ms, max_merged_ms)
         }
+        Command::Transcribe { media, language, api_key_env, terms } => {
+            cmd_transcribe(&media, &language, &api_key_env, terms.as_deref())
+        }
+        Command::TranscribePipeline {
+            media,
+            models_dir,
+            cluster_threshold,
+            max_gap_ms,
+            max_merged_ms,
+            pad_ms,
+            language,
+            api_key_env,
+            terms,
+            out,
+        } => cmd_transcribe_pipeline(
+            &media,
+            &models_dir,
+            cluster_threshold,
+            max_gap_ms,
+            max_merged_ms,
+            pad_ms,
+            &language,
+            &api_key_env,
+            terms.as_deref(),
+            out.as_deref(),
+        ),
     }
 }
 
@@ -447,4 +516,139 @@ fn cmd_serve(cache_path: &std::path::Path, port: u16, max_gap_ms: u64, max_merge
     .context("parsing cache file")?;
 
     serve::run(serve::ServeConfig { cache, max_gap_ms, max_merged_ms }, port)
+}
+
+fn cmd_transcribe(
+    media: &std::path::Path,
+    language: &str,
+    api_key_env: &str,
+    terms: Option<&str>,
+) -> Result<()> {
+    use asr_core::asr::{elevenlabs::ElevenLabsTranscriber, TranscribeRequest, Transcriber};
+
+    let api_key = std::env::var(api_key_env)
+        .with_context(|| format!("reading API key from ${api_key_env} (not set)"))?;
+
+    let pcm = asr_core::audio::load_for_pipeline(media).context("decoding + resampling")?;
+    let audio_sec = pcm.len() as f64 / asr_core::audio::TARGET_SAMPLE_RATE as f64;
+    eprintln!("sending {audio_sec:.1}s of audio to ElevenLabs...");
+
+    let transcriber = ElevenLabsTranscriber::new(api_key);
+    let request = TranscribeRequest {
+        audio: pcm,
+        sample_rate: asr_core::audio::TARGET_SAMPLE_RATE,
+        terms: terms
+            .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_default(),
+        bias_strength: None,
+        context_prompt: None,
+        language: language.to_string(),
+    };
+
+    let start = std::time::Instant::now();
+    let result = transcriber.transcribe(&request).context("ElevenLabs transcription failed")?;
+    let elapsed = start.elapsed();
+
+    println!("elapsed: {:.2}s", elapsed.as_secs_f64());
+    println!("text:    {}", result.text);
+    match &result.words {
+        Some(words) => {
+            println!("words:   {} (with timestamps + confidence)", words.len());
+            for w in words.iter().take(10) {
+                println!(
+                    "  {:>7.1}-{:<7.1}  logprob={:>7.3}  {}",
+                    w.start_ms as f64 / 1000.0,
+                    w.end_ms as f64 / 1000.0,
+                    w.confidence.unwrap_or(f32::NAN),
+                    w.text
+                );
+            }
+            if words.len() > 10 {
+                println!("  ... ({} more)", words.len() - 10);
+            }
+        }
+        None => println!("words:   (none returned)"),
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_transcribe_pipeline(
+    media: &std::path::Path,
+    models_dir: &std::path::Path,
+    cluster_threshold: f32,
+    max_gap_ms: u64,
+    max_merged_ms: u64,
+    pad_ms: u64,
+    language: &str,
+    api_key_env: &str,
+    terms: Option<&str>,
+    out: Option<&std::path::Path>,
+) -> Result<()> {
+    use asr_core::asr::elevenlabs::ElevenLabsTranscriber;
+    use asr_core::diarize::{DiarizeModelPaths, DiarizeParams};
+
+    let api_key = std::env::var(api_key_env)
+        .with_context(|| format!("reading API key from ${api_key_env} (not set)"))?;
+
+    let models = DiarizeModelPaths::under(models_dir);
+    let params = DiarizeParams { cluster_threshold, ..Default::default() };
+
+    eprintln!("--- stage 1/2: diarization ---");
+    let decode_start = std::time::Instant::now();
+    let pcm = asr_core::audio::load_for_pipeline(media).context("decoding + resampling")?;
+    let decode_elapsed = decode_start.elapsed(); // measured before diarize starts, not after
+    let diarize_start = std::time::Instant::now();
+    let raw_segments = asr_core::diarize::diarize(&pcm, &models, &params).context("diarization failed")?;
+    let merged_segments = asr_core::diarize::merge_same_speaker_runs(&raw_segments, max_gap_ms, max_merged_ms);
+    eprintln!(
+        "decoded in {:.1}s, diarized in {:.1}s -> {} merged segments",
+        decode_elapsed.as_secs_f64(),
+        diarize_start.elapsed().as_secs_f64(),
+        merged_segments.len()
+    );
+
+    eprintln!("--- stage 2/2: transcription ({} sequential requests) ---", merged_segments.len());
+    let terms_vec: Vec<String> = terms
+        .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
+    let transcriber = ElevenLabsTranscriber::new(api_key);
+
+    let transcribe_start = std::time::Instant::now();
+    let transcript = asr_core::pipeline::run_transcription_stage(
+        &pcm,
+        &merged_segments,
+        &transcriber,
+        &terms_vec,
+        language,
+        pad_ms,
+    )
+    .context("transcription stage failed")?;
+    eprintln!(
+        "transcribed {} chunks in {:.1}s",
+        transcript.len(),
+        transcribe_start.elapsed().as_secs_f64()
+    );
+
+    let rendered = serde_json::to_string_pretty(&transcript)?;
+    match out {
+        Some(path) => {
+            std::fs::write(path, &rendered)?;
+            eprintln!("wrote transcript to {}", path.display());
+        }
+        None => {
+            for seg in &transcript {
+                println!(
+                    "[{:>7.1}-{:<7.1}] speaker_{}: {}",
+                    seg.start_ms as f64 / 1000.0,
+                    seg.end_ms as f64 / 1000.0,
+                    seg.speaker,
+                    seg.text
+                );
+            }
+        }
+    }
+
+    Ok(())
 }

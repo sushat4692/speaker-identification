@@ -10,11 +10,11 @@
 //! wildly (ElevenLabs ~1000 terms vs. Deepgram ~100 words) and silently
 //! dropping the tail is better than an API error mid-batch.
 //!
-//! **Phase 2 status**: this module defines the trait and request/response
-//! shapes only. The ElevenLabs and Azure HTTP implementations are not yet
-//! written — that requires live API credentials to develop against (see the
-//! plan's "契約・アカウント" section) and is explicitly out of scope for the
-//! contract-free Phase 0/1 work landed so far.
+//! **Phase 2 status**: trait + chunking are implemented; provider clients
+//! are being added one at a time as API credentials become available.
+
+pub mod chunking;
+pub mod elevenlabs;
 
 use serde::{Deserialize, Serialize};
 
