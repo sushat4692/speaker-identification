@@ -815,6 +815,68 @@ N セグメントに N 個の `TextareaState`（`Rope` + undo manager を持つ�
 
 ユーザーが実機で確認し、体感できるレベルで改善（「バッチリ」）。安全のため`git checkout -b textarea-height-precompute`で別ブランチに切ってから実装し、うまくいったので`phase0-1-diarization-core`にマージした。
 
+#### `Cmd`ベースのキーマップ（実装計画）
+
+## Context
+
+計画の「修正UIの仕様」節で決めていたキーマップのうち、セグメントリスト側で対応できる部分を実装する。実装前に実ソース（`gpui-pre-0.3.4`・`gpui-base-0.6.0`）を調べ、当初の想定と2点ズレが見つかったので、その場でユーザーに確認しスコープを決めた:
+
+1. **再生系のキー（`Cmd+Enter`再生/一時停止、`Cmd+←`、`Cmd+[`/`Cmd+]`速度）はまだ動かせない** — `asr-audio`（signalsmith-stretch再生エンジン、3bスパイクで検証済み）がまだGPUIアプリに統合されていないため。→ **キーバインド自体は今回配線し、ハンドラは`tracing::info!`でログを出すだけのプレースホルダーにする**（再生統合時に中身を差し替えるだけで済む）。
+2. **`Enter`でのセグメント分割・`Backspace`での前セグメント結合は、どちらも「普段の編集中に誤発火しやすい」というユーザー指摘で方針変更した**。
+   - **`Enter`は技術的には`submit_on_enter`で実現できると分かったが、ユーザーから「これも安易に分割してしまいそうなので、もう少し特殊なショートカットの方が良い」との指摘**。→ **`Cmd+Shift+Enter`に変更**。これによりむしろ実装が単純になった: `submit_on_enter`は不要で、他のActionと全く同じ`.on_action()`パターンで拾える（`Cmd`付きの組み合わせは`Textarea`内部のEnterハンドラが処理しないキーストロークなので、素直に外側までbubbleする）。素の`Enter`・`Shift+Enter`は編集中も普段通り改行として機能し続ける。
+   - **`Backspace`は当初「技術的に割り込み不可能」と判断し保留にしたが、`Cmd+Shift+Enter`と同じ理屈で解決できると判明**。素の`Backspace`は`InputBaseState::backspace()`（`gpui-base-0.6.0/src/input/base/state.rs:1479`）が無条件に自分で消費してしまうため確かに割り込めないが、ユーザー提案の**`Cmd+Shift+Backspace`**は事情が違う。実ソースで確認したところ`Textarea`はデフォルトで`"cmd-backspace"`を`DeleteToBeginningOfLine`に予約している（`state.rs:131`、`"backspace"`/`"shift-backspace"`/`"ctrl-backspace"`/`"alt-backspace"`も別のActionに予約済み、`state.rs:124-137`）が、**`"cmd-shift-backspace"`は既存バインディングに存在しない**——他のActionと同じ`.on_action()`パターンでそのまま拾える。→ **今回`MergeWithPrevious`として実装する**（保留の撤回）。
+
+   > **方針**: 構造を変える操作（分割・結合）は、素のキー1つではなく`Cmd+Shift`系の複合キーに寄せる——普段のタイピングで偶発的に発火しないようにする。
+
+## 実装する項目
+
+| キー | Action | 実装内容 |
+|---|---|---|
+| `Cmd+↓` / `Cmd+↑` | `NextSegment` / `PreviousSegment` | `focused_row`が`Some`なら次/前のインデックスで`focus_row()`を呼ぶ。`None`なら先頭/末尾にフォーカス |
+| `Cmd+Shift+Enter`（編集中） | `SplitSegment` | カーソル位置でテキストを2分割し、`segments`に新セグメントを1つ挿入。タイムスタンプは文字数比で按分（word単位のタイムスタンプがUI層に無いための近似、その旨コメントに明記） |
+| `Cmd+Shift+Backspace`（編集中） | `MergeWithPrevious` | フォーカス中のセグメントを直前のセグメントに統合（`start_ms`=前者の開始、`end_ms`=後者の終了、`text`=前者+後者を連結、`speaker`=前者を継承）。先頭セグメントでは何もしない |
+| `Cmd+1`〜`Cmd+9` | `AssignSpeaker1`..`AssignSpeaker9` | フォーカス中（無ければ実装上は何もしない）のセグメントの`speaker`フィールドを`0`〜`8`に上書き |
+| `Cmd+Enter` | `PlayPause` | プレースホルダー（`tracing::info!("play/pause (playback not wired yet)")`） |
+| `Cmd+←` | `SeekBack` | プレースホルダー |
+| `Cmd+[` / `Cmd+]` | `RateDown` / `RateUp` | プレースホルダー |
+
+## 実装の要点（実ソースで確認済みのAPI）
+
+- **Action定義**: `gpui_kit::actions!(editor, [NextSegment, PreviousSegment, SplitSegment, MergeWithPrevious, AssignSpeaker1, ..., AssignSpeaker9, PlayPause, SeekBack, RateDown, RateUp])`（`gpui-kit-0.6.0/src/lib.rs`のマクロ、ペイロード無しのunit struct群のみ対応——話者番号ごとに9個の型が必要）。
+- **キーバインド登録**: `cx.bind_keys([KeyBinding::new("cmd-down", NextSegment, None), KeyBinding::new("cmd-shift-enter", SplitSegment, None), KeyBinding::new("cmd-shift-backspace", MergeWithPrevious, None), ...])`（`App::bind_keys`、`gpui-pre-0.3.4/src/app.rs:2242`）を`main()`の`gpui_kit::init(cx)`直後で一度だけ呼ぶ。キーストローク文字列は`"cmd-down"`方式（`gpui-base`内の既存バインディング`KeyBinding::new("cmd-down", MoveToEnd, Some(CONTEXT))`で実例確認済み）。
+- **ハンドラ登録**: ルートの`div()`に`.on_action(|action: &NextSegment, window, cx| {...})`を連ねる（`Interactivity::on_action`、`gpui-pre-0.3.4/src/key_dispatch.rs:333`）。ハンドラ内で`cx.entity()`/`weak`経由で`EditorLayoutDemo`を更新する、既存の`on_click`と同じパターン。`SplitSegment`/`MergeWithPrevious`も同様——どちらも`Textarea`内部のキーマップが処理しない組み合わせなので、素直にルートまでbubbleしてくる。
+
+## 変更するファイル
+
+- `apps/desktop/src/bin/editor_layout_demo.rs`
+  - `actions!`でAction型を定義
+  - `main()`で`cx.bind_keys([...])`
+  - `EditorLayoutDemo`に`split_focused_segment`・`merge_with_previous`・`assign_speaker`・`focus_next`/`focus_previous`メソッドを追加
+  - ルート`div()`に`.on_action(...)`を各Actionぶん追加
+
+## 検証方法
+
+`cd apps/desktop && cargo +nightly build --bin editor-layout-demo`（+ `cargo +nightly clippy --all-targets`）でビルド確認後、起動してユーザーに実機確認してもらう:
+- `Cmd+↓`/`Cmd+↑`でフォーカス行が移動するか
+- 編集中に`Cmd+Shift+Enter`でセグメントが2つに分かれるか（素の`Enter`・`Shift+Enter`は普段通り改行のままか）
+- 編集中に`Cmd+Shift+Backspace`で直前のセグメントと結合されるか（素の`Backspace`・`Cmd+Backspace`は普段通りの削除のままか）
+- `Cmd+1`〜`9`で話者ラベルが変わるか
+- 再生系キー（`Cmd+Enter`/`Cmd+←`/`Cmd+[`/`Cmd+]`）はコンソールログが出るだけで実際には再生されないことを確認（想定通り）
+
+#### 実装結果（追記）
+
+上記の計画通りに実装（`apps/desktop/src/bin/editor_layout_demo.rs`）。ビルド時のエラーは2件のみ、いずれも些細:
+- `apps/desktop`に`tracing`クレートが無かった（他の依存に無い）ので、再生系プレースホルダーのログ出力はこのファイルの既存スタイルに合わせて`println!`に変更
+- `list()`のrender_itemクロージャが`move`で`weak`を完全に消費するため、ルート`div()`側の`.on_action()`群で同じ`weak`を再利用しようとして借用エラー。`root_weak = weak.clone()`を`list`構築より前に用意して分離することで解決
+
+`SplitSegment`/`MergeWithPrevious`の実装で、タイムスタンプの扱いは計画通り単純な近似で済ませた: 分割は文字数比、結合は前セグメントの`start_ms`+後セグメントの`end_ms`をそのまま採用。`cargo +nightly build`/`clippy --all-targets`とも無警告。
+
+**実機確認でバグ発見・修正**: 分割した際、新しい（2つ目の）行は正しくカーソル以降のテキストになるが、**元の（1つ目の）行が分割前の全文のままで内容が重複する**という報告。原因は`split_focused_segment()`内で、`segments[ix].text`を手動で分割済みテキストに書き換えた**後**に`self.commit_focused(cx)`を呼んでいたこと——`commit_focused`は「フォーカス中のTextareaの現在の内容を`segments`に書き戻す」処理なので、まだ古い（分割前の）全文を持ったままの生きたTextareaから読み直してしまい、直前に書き込んだ分割後のテキストを上書きしてしまっていた。修正: 分割後は`commit_focused`を呼ばず、`focused_row`/`editor`を直接`None`にしてから`focus_row(ix + 1, ...)`で新規Textareaを作る（`merge_with_previous`は逆に`commit_focused`を`segments`を触る**前**に呼んでいるため、この問題は無い）。
+
+**追加要望: 分割後、新しい行のカーソル位置は先頭にしてほしい**（`focus_row`の既定は末尾——クリックでの通常フォーカス時にはそれが自然なため）。`lsp_types::Position::new(0, 0)`（`gpui_component::input`が`pub use lsp_types::Position;`で再エクスポート）を`state.set_cursor_position(...)`に渡すことで、`split_focused_segment`だけ`focus_row`直後にカーソルを先頭へ上書きする形で対応。`focus_row`本体の既定動作（末尾）は変更していない。
+
+**追加要望: 分割やCmd+↓/↑でフォーカスが画面外の行に移った時、スクロールして見えるようにしてほしい**。`ListState`に`pub fn scroll_to_reveal_item(&self, ix: usize)`（`gpui-pre-0.3.4/src/elements/list.rs:677`、「アイテムが完全に見えるようスクロールする」）という公開APIがあり、`&self`だけで呼べる（`&mut`不要）。`focus_row()`の末尾に`self.list_state.scroll_to_reveal_item(ix);`を1箇所追加するだけで、クリック・`Cmd+↓/↑`・分割・結合——フォーカスが変わる全経路に一括で効く（`focus_row`が唯一の合流点になっていることを活かした）。
+
 ### Phase 4 — 任意
 - クラウド版（`apps/server`）
 - 編集履歴からの用語自動学習
