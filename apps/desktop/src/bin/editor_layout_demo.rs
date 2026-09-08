@@ -22,6 +22,61 @@ use desktop::speaker_timeline::speaker_timeline;
 /// (`Size::Medium` -> `.text_sm()`) is smaller than plain `div` text.
 const ROW_TEXT_SIZE: Pixels = px(14.0);
 
+/// Experimental: measures how many wrapped visual rows `text` would occupy
+/// at `wrap_width`, using the real text-shaping/wrapping engine
+/// (`WindowTextSystem::shape_text`) rather than a naive chars-per-line
+/// guess — so `auto_grow`'s initial row count can start correct instead of
+/// flashing from 1 row up to the real height on the first layout pass
+/// (`InputBaseState::update_auto_grow` needs a `DisplayMap` that doesn't
+/// exist until then, and it's `pub(super)` — not callable from outside).
+///
+/// `wrap_width` itself is only an approximation (derived from the window's
+/// viewport size and this file's own layout constants, not a real measured
+/// bounds), so this won't be pixel-perfect, but should get much closer than
+/// starting from a fixed 1 row.
+fn measure_wrapped_rows(text: &str, font_size: Pixels, wrap_width: Pixels, window: &Window) -> usize {
+    let text_style = window.text_style();
+    let font = Font {
+        family: text_style.font_family.clone(),
+        features: text_style.font_features.clone(),
+        fallbacks: text_style.font_fallbacks.clone(),
+        weight: text_style.font_weight,
+        style: text_style.font_style,
+    };
+    let run = TextRun {
+        len: text.len(),
+        font,
+        color: text_style.color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    match window
+        .text_system()
+        .shape_text(SharedString::from(text.to_string()), font_size, &[run], Some(wrap_width), None)
+    {
+        Ok(lines) => lines.iter().map(|line| line.wrap_boundaries().len() + 1).sum::<usize>().max(1),
+        Err(_) => 1,
+    }
+}
+
+/// Approximates the text column's rendered width from the window's viewport
+/// size and this file's own layout constants (outer `.p_4()`, the ~42% left
+/// column, `.gap_4()` between columns, the row's `.px_2()`/`.gap_3()` and its
+/// two fixed-width columns). Not an actual measured bounds -- see the
+/// `measure_wrapped_rows` doc comment.
+fn approximate_text_column_width(window: &Window) -> Pixels {
+    let viewport_width = window.viewport_size().width;
+    let outer_padding = px(32.0); // .p_4() left + right (1rem = 16px each)
+    let left_column = viewport_width * 0.42;
+    let column_gap = px(16.0); // .gap_4() between the two top-level columns
+    let right_column_width = viewport_width - outer_padding - left_column - column_gap;
+    let row_padding = px(16.0); // row's .px_2() left + right
+    let row_gaps = px(24.0); // row's .gap_3(), x2 gaps among 3 cells
+    let fixed_columns = px(48.0 + 80.0); // speaker + timestamp columns
+    (right_column_width - row_padding - row_gaps - fixed_columns).max(px(50.0))
+}
+
 struct EditorLayoutDemo {
     segments: Vec<TranscriptSegment>,
     total_duration_ms: u64,
@@ -42,8 +97,10 @@ impl EditorLayoutDemo {
         self.commit_focused(cx);
 
         let text = self.segments[ix].text.clone();
+        let wrap_width = approximate_text_column_width(window);
+        let initial_rows = measure_wrapped_rows(&text, ROW_TEXT_SIZE, wrap_width, window);
         let state = cx.new(|cx| {
-            let mut s = TextareaState::new(window, cx).auto_grow(1, 20);
+            let mut s = TextareaState::new(window, cx).auto_grow(initial_rows, 20);
             s.set_value(text, window, cx);
             // `set_value` resets multi-line inputs' selection to 0..0, so the
             // cursor lands at the start; move it to the end instead. This also

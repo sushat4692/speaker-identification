@@ -805,6 +805,16 @@ N セグメントに N 個の `TextareaState`（`Rope` + undo manager を持つ�
 
 > **それでもごくわずかにズレた**（ユーザー確認・「border分かも」という指摘も的中）。`Input`は既定で`appearance(true)`かつ`bordered(true)`のため`.border_1()`（1px枠線）が自前で付いており、枠線を持たない静的テキスト側との間にpx単位の非対称が残っていた。border付きの静的テキスト版を作るより、**`Textarea::new(&state).appearance(false)`でTextarea側の枠線・背景ごと消す**方を選んだ（ドキュメント通り「appearance=falseでborder/backgroundなし」になる）——今回のゴールは「行を編集モードでも同じ見た目にする」ことなので、装飾を足すより引く方が筋が良い。
 
+#### フォーカス直後に高さが一瞬短くなる現象の解消（実装済み、`textarea-height-precompute`ブランチ→マージ済み）
+
+編集モードに切り替わった瞬間、`auto_grow`が`min_rows`（＝1行）からスタートしてから実際の折り返し行数に更新されるまでの1フレーム分、行の高さが一瞬短くなる現象があった。原因は`InputBaseState::update_auto_grow(&mut self, display_map: &DisplayMap)`（`gpui-base-0.6.0/src/input/base/mode.rs:131`、実際の折り返し行数`display_map.wrap_row_count()`を使って`rows`を更新する）が**`pub(super)`で外部から呼べず**、かつ`DisplayMap`自体がその時点でまだ存在しない（最初のレイアウトパス後に作られる）ため。
+
+**検討したが採用しなかった案**: 公開されている`set_rows(rows, cx)`で初期値を上書きする方法は、`AutoGrow`モードでは`rows`と同時に`max_rows`も同じ値に固定してしまう実装（`state.rs`）のため、それ以上育たなくなる副作用があり却下。「全行を最初から実Textareaにする」案も検討したが、仮想化リストでは画面外の行がそもそも実体化されないため同じ現象がスクロールのたびに起きるようになる上、全行の双方向同期が必要になり複雑化するだけなので却下。
+
+**採用した方法**: `WindowTextSystem::shape_text()`という実際のテキストシェイピング・折り返しエンジンを使い、`.auto_grow(1, 20)`ではなく**実測に近い折り返し行数**を初期値として渡す（`.auto_grow(measure_wrapped_rows(...), 20)`）。行数は`shape_text()`が返す`WrappedLine`ごとの`wrap_boundaries().len() + 1`の合計から算出（`wrap_boundaries`は`gpui-pre-0.3.4/src/text_system/line_layout.rs`で`pub`）。折り返し幅（`wrap_width`）自体は実測ではなく、`window.viewport_size()`とこのレイアウトが使っている定数（`.p_4()`、左カラム42%、`.gap_4()`、行の`.px_2()`/`.gap_3()`、固定幅2列）から計算した近似値——ピクセル完全一致は保証されないが、文字数ベースの見積もりよりずっと実測に近い行数が出せる。
+
+ユーザーが実機で確認し、体感できるレベルで改善（「バッチリ」）。安全のため`git checkout -b textarea-height-precompute`で別ブランチに切ってから実装し、うまくいったので`phase0-1-diarization-core`にマージした。
+
 ### Phase 4 — 任意
 - クラウド版（`apps/server`）
 - 編集履歴からの用語自動学習
