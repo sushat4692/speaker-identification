@@ -171,10 +171,65 @@ enum Command {
         language: String,
         #[arg(long, default_value = "ELEVENLABS_API_KEY")]
         api_key_env: String,
+        /// Comma-separated ad-hoc terms (keyterms only, no post-ASR
+        /// correction — that needs the reading/alias structure a flat
+        /// string list doesn't have). Ignored if --terms-db is given.
         #[arg(long)]
         terms: Option<String>,
+        /// SQLite DB (see `terms::store`) to load registered terms +
+        /// aliases from. When given, terms are sent as keyterms (weight
+        /// order, provider-truncated) AND every transcribed segment is
+        /// run through `terms::correct_text` (layer 3 alias substitution,
+        /// then layer 2 reading-based fuzzy match).
+        #[arg(long)]
+        terms_db: Option<PathBuf>,
+        #[arg(long, default_value = "default")]
+        project_id: String,
+        /// 0.85 measured too strict against a real live ElevenLabs
+        /// response: "アシタカ総研" misheard as "明日化総研" tokenizes
+        /// as 明日/化/総研, whose concatenated reading (アスカソウケン)
+        /// only scores 0.75 against the term's reading (アシタカソウケン)
+        /// -- the exact motivating case for the sliding window never
+        /// fired at 0.85 in production. Lowered to 0.7, matching the
+        /// value already used in the unit test that demonstrates the
+        /// mechanism. See docs/plan.md.
+        #[arg(long, default_value_t = 0.7)]
+        correction_threshold: f32,
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+
+    /// Manage the terminology registry (see the plan doc's 3-layer
+    /// correction design and `terms::store`).
+    Terms {
+        #[command(subcommand)]
+        action: TermsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TermsAction {
+    /// Register a term (and optionally its known alternate surface
+    /// forms — e.g. an English-script rendering; see "クラウドゲート問題"
+    /// in the plan doc).
+    Add {
+        db: PathBuf,
+        #[arg(long, default_value = "default")]
+        project_id: String,
+        surface: String,
+        #[arg(long)]
+        reading: Option<String>,
+        #[arg(long, default_value_t = 1.0)]
+        weight: f32,
+        /// Repeatable: known alternate surface forms for this term.
+        #[arg(long = "alias")]
+        aliases: Vec<String>,
+    },
+    /// List registered terms (and their aliases) for a project.
+    List {
+        db: PathBuf,
+        #[arg(long, default_value = "default")]
+        project_id: String,
     },
 }
 
@@ -243,6 +298,9 @@ fn main() -> Result<()> {
             language,
             api_key_env,
             terms,
+            terms_db,
+            project_id,
+            correction_threshold,
             out,
         } => cmd_transcribe_pipeline(
             &media,
@@ -254,8 +312,12 @@ fn main() -> Result<()> {
             &language,
             &api_key_env,
             terms.as_deref(),
+            terms_db.as_deref(),
+            &project_id,
+            correction_threshold,
             out.as_deref(),
         ),
+        Command::Terms { action } => cmd_terms(action),
     }
 }
 
@@ -584,13 +646,31 @@ fn cmd_transcribe_pipeline(
     language: &str,
     api_key_env: &str,
     terms: Option<&str>,
+    terms_db: Option<&std::path::Path>,
+    project_id: &str,
+    correction_threshold: f32,
     out: Option<&std::path::Path>,
 ) -> Result<()> {
     use asr_core::asr::elevenlabs::ElevenLabsTranscriber;
     use asr_core::diarize::{DiarizeModelPaths, DiarizeParams};
+    use asr_core::terms::{self, store as terms_store};
 
     let api_key = std::env::var(api_key_env)
         .with_context(|| format!("reading API key from ${api_key_env} (not set)"))?;
+
+    // Load the registry once, up front: it feeds both the keyterms sent
+    // *before* ASR and the correction applied *after* it, and both need
+    // the same terms/aliases to stay consistent with each other.
+    let (db_terms, db_aliases) = match terms_db {
+        Some(path) => {
+            let conn = asr_core::store::open(path).context("opening terms DB")?;
+            let db_terms = terms_store::load_terms(&conn, project_id).context("loading terms")?;
+            let db_aliases = terms_store::load_aliases(&conn, project_id).context("loading term aliases")?;
+            eprintln!("loaded {} terms, {} aliases from {}", db_terms.len(), db_aliases.len(), path.display());
+            (db_terms, db_aliases)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
 
     let models = DiarizeModelPaths::under(models_dir);
     let params = DiarizeParams { cluster_threshold, ..Default::default() };
@@ -610,13 +690,21 @@ fn cmd_transcribe_pipeline(
     );
 
     eprintln!("--- stage 2/2: transcription ({} sequential requests) ---", merged_segments.len());
-    let terms_vec: Vec<String> = terms
-        .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
-        .unwrap_or_default();
+    // `--terms-db` takes priority: it carries weight ordering (so the
+    // highest-priority terms survive provider truncation) that a flat
+    // `--terms` string can't express.
+    let terms_vec: Vec<String> = if !db_terms.is_empty() {
+        db_terms.iter().map(|t| t.surface.clone()).collect()
+    } else {
+        terms
+            .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_default()
+    };
+
     let transcriber = ElevenLabsTranscriber::new(api_key);
 
     let transcribe_start = std::time::Instant::now();
-    let transcript = asr_core::pipeline::run_transcription_stage(
+    let mut transcript = asr_core::pipeline::run_transcription_stage(
         &pcm,
         &merged_segments,
         &transcriber,
@@ -630,6 +718,23 @@ fn cmd_transcribe_pipeline(
         transcript.len(),
         transcribe_start.elapsed().as_secs_f64()
     );
+
+    if !db_terms.is_empty() {
+        eprintln!("--- post-processing: terminology correction (layers 2+3) ---");
+        // A fresh user dictionary from the current registry, so lindera's
+        // readings for these exact terms are available (see the plan doc:
+        // lindera returns UNK for OOV words, which registered technical
+        // terms definitionally are).
+        let dict_csv = std::env::temp_dir().join(format!("asr-cli-terms-{}.csv", std::process::id()));
+        terms::build_user_dictionary_csv(&db_terms, &dict_csv).context("building user dictionary")?;
+        let analyzer = terms::ReadingAnalyzer::new(Some(&dict_csv)).context("loading reading analyzer")?;
+        let _ = std::fs::remove_file(&dict_csv); // best-effort; already loaded into memory
+
+        for seg in &mut transcript {
+            seg.text = terms::correct_text(&seg.text, &analyzer, &db_terms, &db_aliases, correction_threshold)
+                .context("correcting segment text")?;
+        }
+    }
 
     let rendered = serde_json::to_string_pretty(&transcript)?;
     match out {
@@ -651,4 +756,54 @@ fn cmd_transcribe_pipeline(
     }
 
     Ok(())
+}
+
+fn cmd_terms(action: TermsAction) -> Result<()> {
+    use asr_core::terms::store as terms_store;
+    use asr_core::terms::Term;
+
+    match action {
+        TermsAction::Add { db, project_id, surface, reading, weight, aliases } => {
+            let conn = asr_core::store::open(&db).context("opening terms DB")?;
+            conn.execute(
+                "INSERT INTO projects (id, name) VALUES (?1, ?1) ON CONFLICT(id) DO NOTHING",
+                [&project_id],
+            )?;
+
+            let term_id = terms_store::add_term(
+                &conn,
+                &project_id,
+                &Term { surface: surface.clone(), reading_kana: reading.clone(), category: None, weight, enabled: true },
+            )
+            .context("adding term")?;
+
+            for alias in &aliases {
+                terms_store::add_alias(&conn, &term_id, alias, None).context("adding alias")?;
+            }
+
+            println!("registered term '{surface}' (id={term_id}) with {} alias(es)", aliases.len());
+            Ok(())
+        }
+        TermsAction::List { db, project_id } => {
+            let conn = asr_core::store::open(&db).context("opening terms DB")?;
+            let terms = terms_store::load_terms(&conn, &project_id).context("loading terms")?;
+            let aliases = terms_store::load_aliases(&conn, &project_id).context("loading aliases")?;
+
+            for term in &terms {
+                println!(
+                    "{}  (reading={}, weight={})",
+                    term.surface,
+                    term.reading_kana.as_deref().unwrap_or("-"),
+                    term.weight
+                );
+                for alias in aliases.iter().filter(|a| a.term_surface == term.surface) {
+                    println!("  = {}", alias.alias_surface);
+                }
+            }
+            if terms.is_empty() {
+                println!("(no terms registered for project '{project_id}')");
+            }
+            Ok(())
+        }
+    }
 }
