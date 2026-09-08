@@ -5,6 +5,10 @@ members = [
     "crates/asr-cli",
     "crates/asr-audio",
 ]
+# apps/desktop is deliberately NOT a member: its gpui-kit dependency needs
+# a nightly toolchain (see apps/desktop/rust-toolchain.toml), which would
+# force the whole workspace onto nightly if it were included here.
+exclude = ["apps/desktop"]
 
 [workspace.package]
 version = "0.1.0"

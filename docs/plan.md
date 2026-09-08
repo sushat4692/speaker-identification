@@ -632,6 +632,61 @@ N セグメントに N 個の `TextareaState`（`Rope` + undo manager を持つ�
   **[zed#62661](https://github.com/zed-industries/zed/issues/62661) の回避策を先回りで適用する** — `Application::new()` の前に `NSApplication sharedApplication` を強制する（AppKit 初期化順序によって候補ウィンドウが出ないまま `insertText:` に劣化するバグ。**単体の GPUI アプリで再現報告あり**）。
   併せて**行入れ替え時のフォーカス／IME 再接続**（前例なし）と**日本語フォントのフォールバック**（[zed#57777](https://github.com/zed-industries/zed/issues/57777) がグリフアトラスの bilinear フィルタが CJK に不利と指摘）も見る。
 
+  #### 3a 実装計画（実ソースでAPIを検証済み）
+
+  `apps/desktop` crate を新設し `gpui-kit = "0.6"` を依存に追加、ワークスペースメンバーに登録（`Cargo.toml`・`apps/desktop/Cargo.toml` 作成済み、`src/bin/ime_spike.rs` は空の雛形のみ）。`cargo fetch` して `~/.cargo/registry/src/.../gpui-kit-0.6.0` 以下を実際に読み、想定との差分を確認した:
+
+  - **`gpui-kit` は内部で `gpui = { package = "gpui-pre", version = "0.3.1" }` に依存**しており、crates.io の停滞した `gpui 0.2.2` ではない実体を再エクスポートしている。計画時点の「`gpui-kit` 経由なら古い `gpui` を避けられる」という判断が実ソースで裏付けられた。
+  - 起動パターン（`gpui-kit` の doc example通り、`gpui-kit-0.6.0/src/lib.rs` に実例あり）:
+    ```rust
+    gpui_kit::application().run(|cx| {
+        gpui_kit::init(cx);
+        cx.spawn(async move |cx| {
+            cx.open_window(WindowOptions::default(), |window, cx| {
+                let view = cx.new(|cx| ImeSpike::new(window, cx));
+                cx.new(|cx| gpui_kit::component::Root::new(view, window, cx))
+            })
+            .expect("failed to open window");
+        })
+        .detach();
+    });
+    ```
+    ウィンドウは `gpui_component::Root` でラップする必要がある（コンポーネントライブラリのポップアップ／コンテキストメニュー等がこれに依存する、doc example通りの構成）。
+  - `Textarea`（`gpui_component::input::Textarea`、`gpui-component-0.6.0/src/input/textarea.rs`）は `Entity<TextareaState>` を受け取るだけの薄いラッパー。`TextareaState` の実体は `gpui_base::input::InputBaseState<TextareaMode>` の type alias（`gpui-base-0.6.0/src/input/textarea/mod.rs`）で、生成はウィンドウのある `Context` 内で `cx.new(|cx| TextareaState::new(window, cx))`（`window` は `open_window` のクロージャから借用）。
+  - `gpui-kit-assets` はアイコン SVG のみ埋め込み（`RustEmbed`）。**日本語フォントはここに含まれない** — 計画通りアプリ側の対応が必要。まずは何も指定せず OS のフォールバックに任せて起動し、グリフが鮮明に出るか（zed#57777 の懸念）を先に目視確認する。
+  - **zed#62661 の回避策を「先回りで適用」する当初方針を変更する**: `gpui-pre-macos`（`gpui-pre-macos-0.3.4/src/platform.rs`）は独自の `GPUIApplication`（`NSApplication` のサブクラス、`ClassDecl::new("GPUIApplication", class!(NSApplication))` で起動時に登録）を使っており、zed の元バグが報告された頃の実装から変わっている可能性がある。**投機的な修正を実測前に埋め込むのは「実測してから直す」というこのプロジェクトの一貫した方針に反する**ため、まず素の状態で動かして実際に候補ウィンドウが出るか確認し、出なければそのときに回避策を追加する。
+
+  **実装・検証ステップ**:
+  1. `apps/desktop/src/bin/ime_spike.rs` に上記の起動パターンで最小ウィンドウを実装。中身は `Textarea` 1つ＋現在のバッファ内容を表示するラベル（目視確認用）。
+  2. `cargo run -p desktop --bin ime_spike` でビルド・起動を確認（ここまではこちらで自動検証できる）。
+  3. **ここから先はユーザー自身による手動検証が必要**（IME変換は実際のキー入力とOS側の変換エンジンに依存し、ターミナルから自動操作できない）。チェックリスト:
+     - 未確定文字列の下線表示
+     - 変換候補ウィンドウの位置
+     - Space での変換
+     - Shift+←/→ での文節再変換
+     - Enter確定 / Esc取消
+     - undo の粒度
+     - 日本語フォントのフォールバック・グリフの鮮明さ
+     - ことえり・Google日本語入力・ATOK の3種で通しでチェック
+  4. 結果に応じて go/no-go 判断。候補ウィンドウが出ない等の致命的な問題があれば zed#62661 型の回避策を追加して再検証。問題なければ 3b（再生エンジンスパイク）へ進む。
+
+  #### 3a 実測結果 — go 判定
+
+  **ビルドで別の実問題に遭遇した**: `gpui-pre-util 0.3.4`（`gpui-kit` が依存する Zed スナップショット系列の1つ）が、安定化されていない標準ライブラリ機能 `slice::as_array`（[rust-lang/rust#133508](https://github.com/rust-lang/rust/issues/133508)、`#![feature(...)]` 宣言なし）を直接呼んでおり、**stable Rust ではビルド不可能**だった。公開されている全バージョン（0.3.0〜0.3.4）で同じ行が存在することを実際に取得して確認済み——最近のリグレッションではなく最初から一貫している。
+
+  対応として `apps/desktop` を nightly スコープにした:
+  - ルートの `Cargo.toml` から `apps/desktop` を除外（`exclude = ["apps/desktop"]`）、`apps/desktop/Cargo.toml` に `[workspace]` を追加して独立したワークスペースルートにした（`crates/*` は引き続き stable のまま）
+  - `apps/desktop/rust-toolchain.toml` で `channel = "nightly"` を指定
+  - `rustup toolchain install nightly` 実行済み
+
+  **一時的な誤診断とその訂正**: 最初にこの nightly 環境でビルドした際も同じ `E0658` エラーが出たため「nightly だけでは不十分で `RUSTC_BOOTSTRAP=1` が要る」と誤って判断した。しかし `target` を完全に削除してクリーンな状態から `cargo +nightly build` を実行し直したところ、`gpui-pre-util` は問題なくコンパイルされ、ビルド全体が成功した。誤診断の原因は、直前の失敗ログを `tail -150` で確認した際に実際に使われていた rustc バージョンの表示行を見落としていたこと（ワークスペース分離作業の途中で一時的に stale な状態を見ていた可能性が高い）。**結論: `RUSTC_BOOTSTRAP` は不要。nightly ツールチェーンを `apps/desktop` にスコープするだけで十分。**
+
+  > 寄り道として、代替案も実測した。**`gpui-ce`**（Zed の gpui を外部消費者向けに再実装したコミュニティフォーク、1000+ stars、`cargo add gpui-ce` で使う設計）は実際に stable Rust で素直にビルドが通った（`gpui-pre` 系列に一切依存しない独立実装）。ただし `gpui-component`（Textarea 等の IME 対応済みウィジェット）は `gpui-pre` にしか対応しておらず、`gpui-ce` と組み合わせられない。また、ユーザーの別プロジェクト（Streaid）が `gpui = "0.2.2"`（素の公式crate）+ `gpui-component = "0.5.1"` で問題なく動いていることも確認した——`gpui-component` は 0.5.1 から 0.6.0 の間のどこかで依存先を素の `gpui 0.2.2` から `gpui-pre` 系列に切り替えており、これが両者の違いの直接の原因だった。今回は最終的に nightly スコープで `gpui-kit 0.6` / `gpui-component 0.6.0` をそのまま使う方針を継続した（最新の実装 + 解決済みの IME 対応を両取りできるため）。
+
+  **IME 実機検証（ユーザー自身が実施）**: ことえり・Google日本語入力・ATOK で、未確定文字列の下線表示・変換候補ウィンドウの位置・Space変換・Shift+←/→ の文節再変換・Enter確定/Esc取消・undo の粒度・日本語フォントのフォールバックとグリフの鮮明さ、**全項目で問題なし**。zed#62661 の回避策は不要だった（先回りで適用せず様子見にした判断が正しかった）。
+
+  **→ go。3b（再生エンジンスパイク）へ進む。**
+
 - **3b. 再生エンジンスパイク（3〜4日）**
   `cpal` + `signalsmith-stretch` と `timestretch` を**実際の日本語音声**で 0.5×/0.75×/1.0×/1.5×/2.0× A/B する。レイテンシ補正後のプレイヘッド精度と、ループ継ぎ目のクリーンさを確認。
 
@@ -668,7 +723,7 @@ N セグメントに N 個の `TextareaState`（`Rope` + undo manager を持つ�
 6. M1 での CoreML/ANE の実効果（LSTM 主体のためフォールバックの可能性）
 
 **UI・音声**
-7. `gpui-kit` の**日本語**固有の IME 挙動（保守チームは中国語 IME が主戦場。ATOK・再変換・文節シフトの証拠は皆無） ← Spike A
+7. ~~`gpui-kit` の**日本語**固有の IME 挙動~~ → **検証済み・go**（ことえり/Google日本語入力/ATOKの3種で全項目問題なし。「3a 実測結果」参照）
 8. `gpui::list` で数千の可変高・フォーカス可能行を扱った際の実コスト（ベンチマーク前例なし）
 9. `signalsmith-stretch` の 0.5×/2.0× での音質（上流の保証は 0.75〜1.5×）、および `.crate` が C++ サブモジュールを同梱しているか（オフラインビルドで確認）
 10. `timestretch` の音声での品質（自称 EDM 最適化）

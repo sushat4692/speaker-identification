@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "desktop"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+gpui-kit = "0.6"
+anyhow = "1"
+
+[[bin]]
+name = "ime-spike"
+path = "src/bin/ime_spike.rs"

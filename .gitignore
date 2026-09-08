@@ -1,4 +1,5 @@
 /target
+apps/desktop/target
 /models
 *.db
 *.db-journal
