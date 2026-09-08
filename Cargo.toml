@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/asr-core",
+    "crates/asr-cli",
+    "crates/asr-audio",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# --- core audio decode / resample ---
+symphonia = { version = "0.6.1", features = ["mp3", "aac", "alac", "isomp4"] }
+rubato = "5.0"
+hound = "3.5"
+
+# --- speaker diarization / VAD (official k2-fsa binding, NOT sherpa-rs) ---
+sherpa-onnx = "1.13.7"
+
+# --- japanese morphological analysis / readings ---
+lindera = "6.0"
+lindera-dictionary = "6.0"
+
+# --- clustering (cross-meeting speaker merge only) ---
+kodama = "0.3"
+rayon = "1"
+
+# --- storage ---
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# --- async / plumbing ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "sync", "time"] }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.dev.package."*"]
+opt-level = 2

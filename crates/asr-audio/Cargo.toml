@@ -1,0 +1,13 @@
+[package]
+name = "asr-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Realtime playback transport: seek, loop region, pitch-preserving rate change. Phase 3 work — see the plan doc's audio spike."
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

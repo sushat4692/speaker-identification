@@ -1,0 +1,9 @@
+/target
+/models
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.DS_Store
+/eval/data
+/debug-data

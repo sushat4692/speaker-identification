@@ -1,0 +1,794 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>話者分離ビューア（検証用）</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #1e1f22;
+    --panel: #2a2b2e;
+    --border: #3d3e42;
+    --text: #e8e8ea;
+    --muted: #9a9ba0;
+    --accent: #5b9cf6;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Hiragino Sans", "Hiragino Kaku Gothic ProN", sans-serif;
+    font-size: 14px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+  }
+  input[type=file] { color: var(--muted); font-size: 13px; }
+  label.filebtn {
+    background: var(--accent);
+    color: white;
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  label.filebtn input { display: none; }
+  .filename { color: var(--muted); font-size: 12px; }
+  button.zoombtn {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    width: 26px; height: 26px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+  }
+  button.zoombtn:hover { background: #34353a; }
+
+  .textinput {
+    background: #141517; color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    font-size: 13px; padding: 4px 8px; width: 220px;
+  }
+  input[type=range] { width: 200px; accent-color: var(--accent); }
+  input[type=range]:disabled { opacity: 0.4; }
+
+  /* --- 2-column main area --- */
+  #main {
+    flex: 1;
+    display: flex;
+    gap: 16px;
+    min-height: 0; /* required for children to be allowed to scroll instead of overflowing */
+  }
+  #videoCol {
+    flex: 0 0 42%;
+    display: flex;
+    align-items: flex-start;
+  }
+  video {
+    width: 100%;
+    max-height: 78vh;
+    background: black;
+    border-radius: 8px;
+    display: block;
+  }
+  #sideCol {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  /* --- timeline (horizontally scrollable) --- */
+  #timelineScroll {
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-radius: 6px;
+    background: #141517;
+    flex: 0 0 auto;
+  }
+  #timelineInner { position: relative; height: 70px; }
+  #ruler { position: relative; height: 18px; }
+  .tick {
+    position: absolute; top: 0; bottom: 0;
+    border-left: 1px solid #333;
+    font-size: 10px; color: var(--muted);
+    padding-left: 3px; white-space: nowrap;
+  }
+  #timeline { position: relative; height: 48px; cursor: pointer; }
+  .seg {
+    position: absolute;
+    top: 4px;
+    bottom: 4px;
+    border-radius: 3px;
+    opacity: 0.85;
+    transition: opacity 0.1s;
+  }
+  .seg:hover { opacity: 1; outline: 1px solid white; }
+  .seg.dimmed { opacity: 0.12; }
+  #playhead {
+    position: absolute;
+    top: 18px;
+    bottom: 0;
+    width: 2px;
+    background: white;
+    pointer-events: none;
+    box-shadow: 0 0 4px rgba(255,255,255,0.8);
+    display: none;
+  }
+
+  #legend { display: flex; flex-wrap: wrap; gap: 6px 14px; flex: 0 0 auto; }
+  .legend-item {
+    display: flex; align-items: center; gap: 6px; cursor: pointer;
+    padding: 3px 8px; border-radius: 5px; font-size: 12px;
+  }
+  .legend-item:hover { background: rgba(255,255,255,0.06); }
+  .legend-item.off { opacity: 0.35; }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }
+  .legend-count { color: var(--muted); }
+  .renamebtn {
+    background: none; border: none; color: var(--muted);
+    cursor: pointer; font-size: 12px; padding: 0 2px; visibility: hidden;
+  }
+  .legend-item:hover .renamebtn { visibility: visible; }
+  .renamebtn:hover { color: var(--text); }
+  .renameinput {
+    background: #141517; color: var(--text);
+    border: 1px solid var(--accent); border-radius: 3px;
+    font-size: 12px; padding: 1px 4px; width: 8em;
+  }
+
+  .stat { color: var(--muted); font-size: 12px; flex: 0 0 auto; }
+
+  /* --- segment table (vertically scrollable, fills remaining height) --- */
+  #tableScroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  thead th {
+    position: sticky; top: 0;
+    background: var(--panel);
+    text-align: left; padding: 6px 8px;
+    color: var(--muted); font-weight: 500;
+    border-bottom: 1px solid var(--border);
+  }
+  td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+  tr.rowhi { background: rgba(91,156,246,0.18); }
+  tr.rowhidden { display: none; }
+  tr:hover { background: rgba(255,255,255,0.04); cursor: pointer; }
+
+  .hint { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>話者分離ビューア（検証用・ローカル専用）</h1>
+
+<div class="row panel">
+  <label class="filebtn">動画を選択<input type="file" id="videoInput" accept="video/*,audio/*"></label>
+  <span class="filename" id="videoName">未選択</span>
+  <label class="filebtn">RTTM / JSON を選択<input type="file" id="dataInput" accept=".rttm,.json,.txt"></label>
+  <span class="filename" id="dataName">未選択</span>
+  <span class="hint">※ どちらもこのブラウザ内だけで読み込みます（外部送信なし）</span>
+  <span style="flex:1"></span>
+  <span class="hint">タイムライン拡大:</span>
+  <button class="zoombtn" id="zoomOut">−</button>
+  <button class="zoombtn" id="zoomIn">＋</button>
+</div>
+
+<div class="row panel">
+  <strong style="font-size:13px">探索モード（ライブ）</strong>
+  <span class="hint">APIサーバー:</span>
+  <input type="text" id="apiUrl" value="http://localhost:7878" class="textinput">
+  <button class="filebtn" id="apiConnect" type="button">接続</button>
+  <span class="filename" id="apiStatus">未接続 — 別途 `asr-cli serve &lt;cache.json&gt;` を起動してください</span>
+  <span style="flex:1"></span>
+  <label class="hint" for="thresholdSlider">閾値</label>
+  <input type="range" id="thresholdSlider" min="0" max="1.2" step="0.01" value="0.3" disabled>
+  <span class="filename" id="thresholdValue">0.30</span>
+</div>
+
+<div class="row panel">
+  <strong style="font-size:13px">正解ラベル作成</strong>
+  <button class="filebtn" id="labelToggle" type="button">開始</button>
+  <span class="hint" id="labelHint">動画を再生しながら 1〜9 キーで話者を切り替え（= その瞬間で区切る）。0 で無音（誰も話していない）を明示。Backspace で直前の区切りを取り消し。</span>
+  <span class="filename" id="labelStatus"></span>
+  <span style="flex:1"></span>
+  <button class="filebtn" id="labelUndo" type="button" disabled>取り消す</button>
+  <button class="filebtn" id="labelClear" type="button" disabled>クリア</button>
+  <button class="filebtn" id="labelDownload" type="button" disabled>RTTM をダウンロード</button>
+</div>
+
+<div id="main">
+  <div id="videoCol">
+    <video id="player" controls></video>
+  </div>
+
+  <div id="sideCol">
+    <div id="timelineScroll">
+      <div id="timelineInner">
+        <div id="ruler"></div>
+        <div id="timeline"><div id="playhead"></div></div>
+      </div>
+    </div>
+
+    <div id="legend"></div>
+    <div class="stat" id="stats"></div>
+
+    <div id="tableScroll">
+      <table id="segTable" style="display:none">
+        <thead><tr><th>開始</th><th>終了</th><th>長さ</th><th>話者</th></tr></thead>
+        <tbody id="segBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const videoInput = document.getElementById('videoInput');
+const dataInput = document.getElementById('dataInput');
+const videoName = document.getElementById('videoName');
+const dataName = document.getElementById('dataName');
+const player = document.getElementById('player');
+const timelineScroll = document.getElementById('timelineScroll');
+const timelineInner = document.getElementById('timelineInner');
+const timeline = document.getElementById('timeline');
+const ruler = document.getElementById('ruler');
+const playhead = document.getElementById('playhead');
+const legend = document.getElementById('legend');
+const stats = document.getElementById('stats');
+const tableScroll = document.getElementById('tableScroll');
+const segTable = document.getElementById('segTable');
+const segBody = document.getElementById('segBody');
+const zoomIn = document.getElementById('zoomIn');
+const zoomOut = document.getElementById('zoomOut');
+const apiUrlInput = document.getElementById('apiUrl');
+const apiConnectBtn = document.getElementById('apiConnect');
+const apiStatus = document.getElementById('apiStatus');
+const thresholdSlider = document.getElementById('thresholdSlider');
+const thresholdValue = document.getElementById('thresholdValue');
+const labelToggle = document.getElementById('labelToggle');
+const labelStatus = document.getElementById('labelStatus');
+const labelUndo = document.getElementById('labelUndo');
+const labelClear = document.getElementById('labelClear');
+const labelDownload = document.getElementById('labelDownload');
+
+let segments = [];   // {startMs, endMs, speaker}
+let durationMs = 0;  // from video metadata (falls back to max segment end)
+let hiddenSpeakers = new Set();
+let speakerColors = new Map();
+// Display-only rename, keyed by the original speaker id from the data file.
+// Cosmetic for now — grouping/highlighting/hide-toggle all still key off the
+// raw id (tr.dataset.speaker etc.), so renaming never breaks that matching.
+let speakerNames = new Map();
+let pxPerSec = 40;
+let currentRowEl = null;
+
+function displayName(spk) {
+  return speakerNames.get(spk) || spk;
+}
+
+const PALETTE = [
+  '#5b9cf6', '#f6845b', '#5bf6a0', '#f65b9c', '#f6d95b',
+  '#9c5bf6', '#5bf6e8', '#f65b5b', '#8cf65b', '#f68cf6',
+  '#5b7ff6', '#c8f65b', '#f6a05b', '#5bf65b', '#f65bd9',
+  '#5bd9f6', '#a05bf6', '#f6c85b', '#5bf68c', '#f65b7f',
+];
+
+function colorFor(speaker) {
+  if (!speakerColors.has(speaker)) {
+    speakerColors.set(speaker, PALETTE[speakerColors.size % PALETTE.length]);
+  }
+  return speakerColors.get(speaker);
+}
+
+function fmtTime(ms) {
+  const s = ms / 1000;
+  const m = Math.floor(s / 60);
+  const sec = (s - m * 60).toFixed(1);
+  return `${m}:${sec.padStart(4, '0')}`;
+}
+
+function fmtTick(sec) {
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec - m * 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+videoInput.addEventListener('change', () => {
+  const file = videoInput.files[0];
+  if (!file) return;
+  videoName.textContent = file.name;
+  player.src = URL.createObjectURL(file);
+});
+
+dataInput.addEventListener('change', () => {
+  const file = dataInput.files[0];
+  if (!file) return;
+  dataName.textContent = file.name;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      applySegments(parseData(file.name, e.target.result));
+    } catch (err) {
+      alert('読み込みに失敗しました: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+});
+
+// Shared by the static file-load path above and the live 探索モード path
+// below. Speaker integer labels aren't stable identities across a
+// different file *or* a different re-cluster threshold (kodama just
+// assigns them in cluster-discovery order each time), so starting every
+// load — file or live — from a clean slate is the semantically correct
+// choice, not merely the simplest one.
+function applySegments(newSegments) {
+  segments = newSegments;
+  hiddenSpeakers.clear();
+  speakerColors.clear();
+  speakerNames.clear();
+  render();
+}
+
+// --- 探索モード（ライブ）: calls the real Rust recluster() over HTTP —
+// see crates/asr-cli/src/serve.rs. Deliberately a separate, independently
+// invoked control path from the static file loader above (per the plan
+// doc's decision not to silently chain the two diarization backends
+// together): connecting here never touches whatever was loaded via the
+// file inputs, and vice versa.
+let apiConnected = false;
+let reclusterDebounce = null;
+
+apiConnectBtn.addEventListener('click', async () => {
+  const base = apiUrlInput.value.trim().replace(/\/$/, '');
+  apiStatus.textContent = '接続中...';
+  try {
+    const res = await fetch(`${base}/health`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const info = await res.json();
+    apiConnected = true;
+    thresholdSlider.disabled = false;
+    apiStatus.textContent = `接続済み（${info.windows}窓・${info.embedding_dim}次元）`;
+    doRecluster(base);
+  } catch (err) {
+    apiConnected = false;
+    thresholdSlider.disabled = true;
+    apiStatus.textContent = `接続失敗: ${err.message}`;
+  }
+});
+
+thresholdSlider.addEventListener('input', () => {
+  thresholdValue.textContent = parseFloat(thresholdSlider.value).toFixed(2); // instant feedback
+  if (!apiConnected) return;
+  clearTimeout(reclusterDebounce);
+  const base = apiUrlInput.value.trim().replace(/\/$/, '');
+  // Debounced, not per-tick: even at ~250ms/recluster (the practicality
+  // test's measured range), firing on every slider tick would queue up
+  // requests faster than they resolve. Waiting for the user to pause
+  // briefly is what actually makes this *feel* live rather than laggy.
+  reclusterDebounce = setTimeout(() => doRecluster(base), 200);
+});
+
+async function doRecluster(base) {
+  const threshold = thresholdSlider.value;
+  apiStatus.textContent = '再計算中...';
+  try {
+    const res = await fetch(`${base}/recluster?threshold=${threshold}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    applySegments(data.segments.map(s => ({
+      startMs: s.start_ms, endMs: s.end_ms, speaker: String(s.speaker),
+    })));
+    apiStatus.textContent =
+      `接続済み — ${data.elapsed_ms.toFixed(0)}ms・${data.num_speakers}話者・${data.segments.length}区間`;
+  } catch (err) {
+    apiStatus.textContent = `再計算エラー: ${err.message}`;
+  }
+}
+
+function parseData(name, text) {
+  const trimmed = text.trim();
+  if (name.toLowerCase().endsWith('.json') || trimmed.startsWith('[')) {
+    const arr = JSON.parse(trimmed);
+    return arr.map(s => ({
+      startMs: s.start_ms ?? s.startMs,
+      endMs: s.end_ms ?? s.endMs,
+      speaker: String(s.speaker),
+    }));
+  }
+  // RTTM: `SPEAKER <uri...> 1 <start> <dur> <NA> <NA> <name> <NA> <NA>`
+  // The uri may itself contain spaces (real recording filenames often do),
+  // so fields are read from the END of the line, not positionally from the
+  // start — the same fix applied in crates/asr-cli/src/rttm.rs after this
+  // exact bug surfaced on a real meeting recording's filename.
+  const out = [];
+  for (const line of trimmed.split('\n')) {
+    const t = line.trim();
+    if (!t.startsWith('SPEAKER')) continue;
+    const f = t.split(/\s+/);
+    if (f.length < 9) continue;
+    const n = f.length;
+    const start = parseFloat(f[n - 7]);
+    const dur = parseFloat(f[n - 6]);
+    const speaker = f[n - 3];
+    out.push({ startMs: Math.round(start * 1000), endMs: Math.round((start + dur) * 1000), speaker });
+  }
+  return out;
+}
+
+function niceTickInterval(targetPx) {
+  const niceSeconds = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
+  for (const sec of niceSeconds) {
+    if (sec * pxPerSec >= targetPx) return sec;
+  }
+  return niceSeconds[niceSeconds.length - 1];
+}
+
+function render() {
+  timeline.querySelectorAll('.seg').forEach(el => el.remove());
+  ruler.querySelectorAll('.tick').forEach(el => el.remove());
+  legend.innerHTML = '';
+  segBody.innerHTML = '';
+  currentRowEl = null;
+
+  if (segments.length === 0) return;
+
+  durationMs = Math.max(player.duration ? player.duration * 1000 : 0, ...segments.map(s => s.endMs));
+  const totalPx = Math.max((durationMs / 1000) * pxPerSec, timelineScroll.clientWidth);
+  timelineInner.style.width = totalPx + 'px';
+
+  // Ruler ticks, spaced so labels don't crowd each other regardless of zoom.
+  const tickSec = niceTickInterval(70);
+  for (let t = 0; t <= durationMs / 1000; t += tickSec) {
+    const tick = document.createElement('div');
+    tick.className = 'tick';
+    tick.style.left = (t * pxPerSec) + 'px';
+    tick.textContent = fmtTick(t);
+    ruler.appendChild(tick);
+  }
+
+  // Speakers ordered by total speaking time, most first — matches how we've
+  // been eyeballing "who's real vs. a fragment" all session.
+  const totals = new Map();
+  for (const s of segments) totals.set(s.speaker, (totals.get(s.speaker) || 0) + (s.endMs - s.startMs));
+  const speakerOrder = [...totals.keys()].sort((a, b) => totals.get(b) - totals.get(a));
+  for (const spk of speakerOrder) colorFor(spk);
+
+  for (const spk of speakerOrder) {
+    const totalSec = (totals.get(spk) / 1000).toFixed(1);
+    const item = document.createElement('div');
+    item.className = 'legend-item' + (hiddenSpeakers.has(spk) ? ' off' : '');
+
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = colorFor(spk);
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'legend-name';
+    nameEl.textContent = displayName(spk);
+
+    const countEl = document.createElement('span');
+    countEl.className = 'legend-count';
+    countEl.textContent = `（${totalSec}s）`;
+
+    const renameBtn = document.createElement('button');
+    renameBtn.className = 'renamebtn';
+    renameBtn.title = '名前を変更';
+    renameBtn.textContent = '✎';
+
+    item.append(swatch, nameEl, countEl, renameBtn);
+
+    // Toggle visibility on the item itself, but not when the click
+    // originated from the rename button or an in-progress rename input.
+    item.addEventListener('click', (ev) => {
+      if (ev.target === renameBtn || ev.target.tagName === 'INPUT') return;
+      if (hiddenSpeakers.has(spk)) hiddenSpeakers.delete(spk); else hiddenSpeakers.add(spk);
+      const isHidden = hiddenSpeakers.has(spk);
+      item.classList.toggle('off', isHidden);
+      timeline.querySelectorAll(`.seg[data-speaker="${cssEscape(spk)}"]`)
+        .forEach(el => el.classList.toggle('dimmed', isHidden));
+      segBody.querySelectorAll(`tr[data-speaker="${cssEscape(spk)}"]`)
+        .forEach(tr => tr.classList.toggle('rowhidden', isHidden));
+    });
+
+    renameBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const input = document.createElement('input');
+      input.className = 'renameinput';
+      input.value = displayName(spk);
+      nameEl.replaceWith(input);
+      input.focus();
+      input.select();
+
+      // Guard against double-commit: Enter commits directly (not merely via
+      // blur — relying solely on the blur *event* firing turned out to be
+      // fragile, e.g. it never fires at all in some automated/headless
+      // browser contexts since it depends on the OS actually handing the
+      // window real focus), and a real user tabbing/clicking away still
+      // triggers blur afterward, which the guard makes a harmless no-op.
+      let committed = false;
+      const commit = () => {
+        if (committed) return;
+        committed = true;
+        const value = input.value.trim();
+        if (value && value !== spk) speakerNames.set(spk, value);
+        else speakerNames.delete(spk);
+        render(); // cosmetic-only rename: cheapest correct way to propagate
+                  // the new display name to the legend, table, and tooltips.
+      };
+      input.addEventListener('keydown', (kev) => {
+        if (kev.key === 'Enter') commit();
+        if (kev.key === 'Escape') { committed = true; render(); } // discard, keep old name
+      });
+      input.addEventListener('blur', commit);
+    });
+
+    legend.appendChild(item);
+  }
+
+  for (const seg of segments) {
+    const el = document.createElement('div');
+    el.className = 'seg';
+    el.dataset.speaker = seg.speaker;
+    el.style.left = (seg.startMs / 1000 * pxPerSec) + 'px';
+    el.style.width = Math.max((seg.endMs - seg.startMs) / 1000 * pxPerSec, 2) + 'px';
+    el.style.background = colorFor(seg.speaker);
+    el.title = `${displayName(seg.speaker)}  ${fmtTime(seg.startMs)} 〜 ${fmtTime(seg.endMs)}`;
+    if (hiddenSpeakers.has(seg.speaker)) el.classList.add('dimmed');
+    el.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      player.currentTime = seg.startMs / 1000;
+      player.play();
+    });
+    timeline.appendChild(el);
+  }
+  playhead.style.display = 'block';
+
+  stats.textContent = `区間数: ${segments.length}　話者数: ${speakerOrder.length}`;
+
+  segTable.style.display = '';
+  for (const seg of segments) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${fmtTime(seg.startMs)}</td><td>${fmtTime(seg.endMs)}</td>` +
+      `<td>${((seg.endMs - seg.startMs) / 1000).toFixed(1)}s</td>` +
+      `<td><span class="swatch" style="background:${colorFor(seg.speaker)};display:inline-block;margin-right:6px"></span>${displayName(seg.speaker)}</td>`;
+    tr.addEventListener('click', () => { player.currentTime = seg.startMs / 1000; player.play(); });
+    tr.dataset.start = seg.startMs;
+    tr.dataset.end = seg.endMs;
+    tr.dataset.speaker = seg.speaker;
+    if (hiddenSpeakers.has(seg.speaker)) tr.classList.add('rowhidden');
+    segBody.appendChild(tr);
+  }
+}
+
+function cssEscape(s) {
+  return s.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+timeline.addEventListener('click', (ev) => {
+  if (!durationMs) return;
+  const rect = timeline.getBoundingClientRect();
+  const clickPx = ev.clientX - rect.left;
+  player.currentTime = clickPx / pxPerSec;
+});
+
+zoomIn.addEventListener('click', () => { pxPerSec = Math.min(pxPerSec * 1.5, 800); render(); });
+zoomOut.addEventListener('click', () => { pxPerSec = Math.max(pxPerSec / 1.5, 2); render(); });
+
+// Keep an element visible within its own scrolling ancestor without
+// stealing focus from a user who's manually scrolled elsewhere — only
+// nudge the scroll position when the element is actually out of view
+// (edge-triggered), not every frame.
+function keepVisibleWithin(container, el, marginFrac) {
+  const cRect = container.getBoundingClientRect();
+  const eRect = el.getBoundingClientRect();
+  const margin = cRect.width * marginFrac;
+  if (eRect.left < cRect.left + margin) {
+    container.scrollLeft -= (cRect.left + margin - eRect.left);
+  } else if (eRect.right > cRect.right - margin) {
+    container.scrollLeft += (eRect.right - (cRect.right - margin));
+  }
+}
+
+function syncPlayhead() {
+  if (durationMs > 0) {
+    const curMs = player.currentTime * 1000;
+    const px = curMs / 1000 * pxPerSec;
+    playhead.style.left = px + 'px';
+    // Only auto-follow while actually playing. Otherwise this re-check runs
+    // every animation frame regardless of *why* the playhead's on-screen
+    // position changed — including the user manually scrolling the
+    // timeline while paused — and would immediately snap it back,
+    // fighting free exploration of a paused recording.
+    if (!player.paused) {
+      keepVisibleWithin(timelineScroll, playhead, 0.1);
+    }
+
+    let newCurrentRow = null;
+    segBody.querySelectorAll('tr').forEach(tr => {
+      const active = curMs >= +tr.dataset.start && curMs < +tr.dataset.end;
+      tr.classList.toggle('rowhi', active);
+      if (active) newCurrentRow = tr;
+    });
+    if (newCurrentRow && newCurrentRow !== currentRowEl) {
+      currentRowEl = newCurrentRow;
+      currentRowEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }
+  requestAnimationFrame(syncPlayhead);
+}
+requestAnimationFrame(syncPlayhead);
+
+player.addEventListener('loadedmetadata', render);
+window.addEventListener('resize', () => { if (segments.length) render(); });
+
+// --- 正解ラベル作成 ---
+// Builds ground-truth reference segments by ear (play the recording, press
+// 1-9 the instant the speaker changes), exported as RTTM for `asr-cli
+// eval`. Without this there's no way to get past eyeballing speaker
+// counts into real DER-based tuning — see the plan doc's Phase 1 goal.
+//
+// `labelSessionStarted` (has a session ever begun) is tracked separately
+// from `labelMode` (currently capturing keystrokes) so that pausing to
+// scrub around and re-listen doesn't wipe what's been marked so far —
+// only the explicit クリア button does that.
+let labelSessionStarted = false;
+let labelMode = false;
+let labelSegments = []; // finalized {startMs, endMs, speaker}
+let openLabel = null;   // {startMs, speaker} — in progress, not yet closed
+
+labelToggle.addEventListener('click', () => {
+  if (!labelSessionStarted) {
+    if (segments.length > 0 && !confirm('表示中のデータは消してラベル作成を始めます。よろしいですか？')) return;
+    labelSessionStarted = true;
+    labelSegments = [];
+    openLabel = null;
+    hiddenSpeakers.clear();
+    speakerColors.clear();
+    speakerNames.clear();
+    labelClear.disabled = false;
+    labelDownload.disabled = false;
+    labelUndo.disabled = false;
+  }
+  labelMode = !labelMode;
+  labelToggle.textContent = labelMode ? '一時停止' : '再開';
+  refreshLabelView();
+});
+
+labelClear.addEventListener('click', () => {
+  if (!confirm('作成中のラベルを全て消します。よろしいですか？')) return;
+  labelSegments = [];
+  openLabel = null;
+  refreshLabelView();
+});
+
+labelUndo.addEventListener('click', undoLastMark);
+
+labelDownload.addEventListener('click', () => {
+  const base = (videoName.textContent && videoName.textContent !== '未選択')
+    ? videoName.textContent.replace(/\.[^.]+$/, '')
+    : 'labels';
+  downloadText(`${base}.rttm`, renderLabelsAsRttm(base));
+});
+
+function markSpeaker(speakerKey) {
+  const curMs = Math.round(player.currentTime * 1000);
+  if (openLabel && openLabel.speaker === speakerKey) return; // no actual change
+  if (openLabel && curMs > openLabel.startMs) {
+    labelSegments.push({ startMs: openLabel.startMs, endMs: curMs, speaker: openLabel.speaker });
+  }
+  openLabel = { startMs: curMs, speaker: speakerKey };
+  refreshLabelView();
+}
+
+function markSilence() {
+  const curMs = Math.round(player.currentTime * 1000);
+  if (!openLabel) return; // already silent, no-op
+  if (curMs > openLabel.startMs) {
+    labelSegments.push({ startMs: openLabel.startMs, endMs: curMs, speaker: openLabel.speaker });
+  }
+  openLabel = null; // deliberately don't open a new segment — see RTTM
+                     // semantics note in refreshLabelView/renderLabelsAsRttm
+  refreshLabelView();
+}
+
+function undoLastMark() {
+  if (labelSegments.length === 0) {
+    openLabel = null;
+  } else {
+    const last = labelSegments.pop();
+    openLabel = { startMs: last.startMs, speaker: last.speaker };
+  }
+  refreshLabelView();
+}
+
+// Live preview = finalized segments + the in-progress one extended to the
+// current playhead position, rendered through the same timeline/legend/
+// table pipeline the file-load and live-API paths already use.
+function refreshLabelView() {
+  const curMs = Math.round(player.currentTime * 1000);
+  const preview = openLabel
+    ? [{ startMs: openLabel.startMs, endMs: Math.max(curMs, openLabel.startMs + 1), speaker: openLabel.speaker }]
+    : [];
+  segments = [...labelSegments, ...preview];
+  render();
+
+  // No open segment reads as "無音" uniformly now — whether that's because
+  // the user just pressed 0, or because no speaker key has been pressed
+  // yet, both are "nothing attributed to a speaker right now".
+  const current = openLabel ? displayName(openLabel.speaker) : '無音';
+  labelStatus.textContent = labelSessionStarted
+    ? `${labelSegments.length}区間確定・現在=${current}${labelMode ? '' : '（一時停止中）'}`
+    : '';
+}
+
+function renderLabelsAsRttm(uri) {
+  const curMs = Math.round(player.currentTime * 1000);
+  const all = openLabel && curMs > openLabel.startMs
+    ? [...labelSegments, { startMs: openLabel.startMs, endMs: curMs, speaker: openLabel.speaker }]
+    : labelSegments;
+  let out = '';
+  for (const seg of all) {
+    if (seg.endMs <= seg.startMs) continue;
+    const startSec = (seg.startMs / 1000).toFixed(3);
+    const durSec = ((seg.endMs - seg.startMs) / 1000).toFixed(3);
+    const name = displayName(seg.speaker).replace(/\s+/g, '_');
+    out += `SPEAKER ${uri} 1 ${startSec} ${durSec} <NA> <NA> ${name} <NA> <NA>\n`;
+  }
+  return out;
+}
+
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+document.addEventListener('keydown', (ev) => {
+  if (!labelMode) return;
+  const tag = document.activeElement && document.activeElement.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+  if (ev.key >= '1' && ev.key <= '9') {
+    ev.preventDefault();
+    markSpeaker(ev.key);
+  } else if (ev.key === '0') {
+    // Mark silence: close whatever was open, but don't start a new speaker
+    // segment. Without this, every moment — including real pauses between
+    // utterances — gets attributed to whichever speaker was talking right
+    // before it, which inflates DER's "missed detection" against a real
+    // diarizer that (correctly, via VAD) treats those pauses as silence.
+    ev.preventDefault();
+    markSilence();
+  } else if (ev.key === 'Backspace') {
+    ev.preventDefault();
+    undoLastMark();
+  }
+});
+</script>
+</body>
+</html>

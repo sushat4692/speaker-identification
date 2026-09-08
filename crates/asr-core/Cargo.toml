@@ -1,0 +1,39 @@
+[package]
+name = "asr-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "UI-agnostic core: audio decode, diarization, speaker ID, ASR providers, terminology, pipeline orchestration. No UI/HTTP framework dependencies belong here."
+
+[dependencies]
+symphonia.workspace = true
+rubato.workspace = true
+hound.workspace = true
+sherpa-onnx.workspace = true
+lindera = { workspace = true, features = ["embed-unidic"] }
+lindera-dictionary.workspace = true
+kodama.workspace = true
+rayon.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[features]
+default = []
+# Optional local ASR fallback. Kept out of default build: whisper.cpp is the
+# heaviest build in this stack (cmake + clang submodule).
+local-whisper = ["dep:whisper-rs"]
+
+[dependencies.whisper-rs]
+version = "0.16"
+optional = true
+features = ["metal"]
