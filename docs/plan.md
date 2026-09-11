@@ -708,7 +708,11 @@ Projects（プロジェクト一覧、名前だけで新規作成できる）
 
 ## 実機検証待ち（実装済み・ユーザーによる確認が未完了）
 
-### セグメントリストのスクロール性能改善（実装済み）
+### セグメントリストのスクロール性能改善（TODO・未解決——実機確認の結果、効果なし〜悪化の疑い）
+
+**実機確認の結果（追記）**: ユーザーが3000件データで実際に確認したところ、「全く解消していない、むしろ悪化してるまである」とのこと。下記の設計・実装自体はビルド・clippy・スモークテストは通っているが、**体感上のスクロール性能は改善していない**——`Rc`化やO(n)処理の削減が真因を外していた可能性がある（例: そもそも`gpui::list`の仮想化前提が崩れる別の要因がある、`SumTree`のB-treeシーク自体が3000件規模では別のボトルネックになっている、等、まだ特定できていない）。優先度は下げつつ、TODOとして残す——次に着手する時は「本当に直っているか」を実機のプロファイリング（例: フレーム時間の実測、どの処理が実際に重いかの再特定）から仕切り直す必要がある。以下は「効果が無かった」実装の記録として残す。
+
+### （記録）当初の調査・実装内容
 
 **Context**: 3000件の合成データ（`debug-data/pipeline_transcript_stress.json`）でスクロールが「全然駄目、ガクガク」との報告。ユーザーは「見えない所でレンダリングしているのでは、GPUIでVirtualScrollできないか」と推測。調査の結果、**推測は誤りで`gpui::list`自体は正しく仮想化されている**ことが判明した——真因はアプリ側の`EditorScreen::render`が毎スクロールフレームごとに行っているO(n)の重い処理。
 
@@ -738,11 +742,10 @@ Projects（プロジェクト一覧、名前だけで新規作成できる）
 
 `cargo build --workspace`/`clippy --workspace --all-targets`、`cd apps/desktop && cargo +nightly build --all-targets`/`clippy --all-targets`とも警告・エラーゼロ。起動スモークテスト2パターン（`debug-data/pipeline_transcript_stress.json`3000件・通常の51件データ）でクラッシュ無し確認済み。
 
-**未検証（実機での操作が必要——体感速度はこちらでは測定できない）**:
+**確認結果**:
 
-1. `debug-data/pipeline_transcript_stress.json`（3000件）を開発用ショートカットで開き、スクロールが滑らかになったか（体感で明確に改善しているか）
-2. 通常の実データ（51セグメント）でも今まで通り問題なく動くか
-3. セグメントの追加・削除・分割・結合・Undo/Redoが従来通り正しく動くか（`Rc::make_mut`化による退行が無いか）
+1. `debug-data/pipeline_transcript_stress.json`（3000件）でのスクロール体感——**改善なし、悪化の疑いすらあるとの報告**（上記「実機確認の結果」参照）。
+2. 通常の実データ（51セグメント）・追加/削除/分割/結合/Undo/Redoの退行有無——未報告（今回のTODO化に伴い保留）。
 
 ---
 
@@ -756,6 +759,73 @@ Projects（プロジェクト一覧、名前だけで新規作成できる）
 
 ---
 
+## 今回の対応範囲：話者分離「探索モード」のUI配線
+
+### Context
+
+`crates/asr-core/src/diarize/fast.rs`に「探索モード」（VAD＋固定窓の埋め込み抽出＋しきい値で即座に再クラスタリング）が実装済みだが、実際のGPUIアプリには一切繋がっていない（`asr-cli`の`fast-cache`/`fast-recluster`/`fast-sweep`/`serve`サブコマンドと、それ用のブラウザ版スライダーUI`tools/diarization-viewer.html`でのみ動作確認されている）。ユーザーの指摘で発覚。今回、アップロード画面に「ファイルを選んだら自動でバックグラウンド解析→スライダーで話者数の見え方を確認→「処理を開始」」という流れとして本実装する。
+
+**確定モードとの連携方針**（ユーザー確認済み）: 探索モードで見つけたしきい値の数値（`f64`、確定モードの`cluster_threshold: f32`とはスケールが別物——`fast.rs`のコメントが明記）はそのまま渡さない。代わりに、探索モードのプレビューから求まる**検出話者数**を`DiarizeParams.num_speakers: Option<i32>`（既存フィールド、`None`＝しきい値モード）にヒントとして渡す。これならスケール不一致の懸念を回避できる。探索が終わっていない/失敗していても「処理を開始」は今まで通り`DiarizeParams::default()`（`cluster_threshold: 0.9`）で動く——非破壊的な追加機能。
+
+### 設計
+
+**`crates/asr-core`側の変更は無し**——`diarize::fast::{FastModelPaths, WindowParams, EmbeddingCache, build_embedding_cache, recluster}`と`diarize::merge_same_speaker_runs`は既に`pub`で必要十分（`build_embedding_cache`が重い一回きりの処理＝VAD＋埋め込み抽出、`recluster`が軽い再クラスタリング＝しきい値ごとに呼ぶ想定、という重い/軽いの境界も`fast.rs`のコメントと実測（54分の会議で約250ms/recluster）から確認済み）。
+
+**`apps/desktop/src/bin/app.rs`**:
+
+1. `UploadScreen`に`explore: ExploreState`フィールドを追加。
+   ```rust
+   enum ExploreState {
+       Idle,
+       Building, // build_embedding_cache が spawn_dedicated で実行中
+       Ready {
+           cache: Arc<asr_core::diarize::fast::EmbeddingCache>,
+           total_duration_ms: u64,
+           slider: Entity<SliderState>,
+           _slider_subscription: Subscription, // Releaseイベント購読を生かし続ける
+           preview: Vec<SegmentBlock>,
+           distinct_speakers: usize,
+           generation: Arc<AtomicU64>, // 古いrecluster結果を捨てるため
+           painted_bounds: Rc<Cell<Bounds<Pixels>>>,
+       },
+       Failed(String), // 「処理を開始」はブロックしない・エラーはそのまま無視して進める
+   }
+   ```
+   `open_upload`での初期化は`ExploreState::Idle`。
+
+2. `pick_media`の成功時（`upload.media_path = Some(path)`を設定する箇所）に`start_explore(cx)`を追加で呼ぶ。
+
+3. `start_explore(&mut self, cx: &mut Context<Self>)`（新規）: `explore = Building`にしてから`cx.background_executor().spawn_dedicated(...)`（`start_pipeline`と同じ、ONNXモデルロードのため専用スレッド必須）で
+   `asr_core::audio::load_for_pipeline(path)` → `FastModelPaths::under(&models_dir)` → `build_embedding_cache(&samples, &models, &WindowParams::default())` → 初期しきい値（0.3、CLI/viewerのデフォルトに合わせる）で`recluster`→`merge_same_speaker_runs(_, 500, 60_000)`を実行し、`cx.spawn`で結果を`this.update`に戻して`ExploreState::Ready`（`SliderState::new().min(0.0).max(1.2).step(0.01).default_value(0.3)`を`cx.new`で生成し、`cx.subscribe`で`SliderEvent::Release`を購読）にする。完了時に`upload.media_path`が呼び出し時と一致するかを確認し、一致しなければ結果を捨てる（別ファイルに選び直された場合の保護）。失敗時は`ExploreState::Failed(msg)`。
+
+4. スライダーの`SliderEvent::Release(value)`ハンドラ（新規メソッド）: `generation`をインクリメントし、`cache.clone()`を`cx.background_executor().spawn(...)`（`_dedicated`ではない、ONNX不要の軽い処理）で`recluster`→`merge_same_speaker_runs`、完了時に`generation`が変わっていなければ`preview`/`distinct_speakers`を更新。`SliderEvent::Change`では何もしない（表示位置の更新はスライダー自身がやってくれる）——ドラッグ中の毎フレーム再計算は約250ms/回で確実にラグになるため、離した時だけ計算する設計。
+
+5. `start_pipeline`: `DiarizeParams::default()`をそのままにせず、`upload.explore`が`Ready { distinct_speakers, .. }`（`distinct_speakers > 0`）なら`DiarizeParams { num_speakers: Some(distinct_speakers as i32), ..Default::default() }`を使う。それ以外（`Idle`/`Building`/`Failed`）は従来通り`DiarizeParams::default()`。
+
+6. UI: 既存の「音声/動画を選ぶ」ボタンと「処理を開始」ボタンの間に、`upload.explore`に応じた表示を追加——`Building`なら「話者数を分析中…」＋`Progress::new(..).loading(true)`、`Ready`なら「検出された話者数: N人（推定）」ラベル＋`Slider::new(&slider).horizontal()`（`use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};`、`Progress`と同じ import流儀）＋固定幅（480px程度）に収まるよう`pixels_per_second`を`total_duration_ms`から逆算した`speaker_timeline(preview, total_duration_ms, pixels_per_second, ..)`のプレビュー、`Failed`なら小さく赤字（他のエラー表示と同じ色）。`Idle`（未選択）は何も出さない。
+
+7. `apps/desktop/src/speaker_timeline.rs`: `playhead_ms: u64`を`playhead_ms: Option<u64>`に変更し、`None`なら再生ヘッドの白線を描画しない（`Some`の時だけ現行通り）。理由: このプレビュー画面には実`Transport`が無く、再生位置という概念自体が無いため。既存の唯一の呼び出し元（`EditorScreen::render`、実エディタ）は`Some(playhead_ms)`に変更するだけで動作は変わらない。
+
+**変更するファイル**: `apps/desktop/src/bin/app.rs`（`UploadScreen.explore`＋`ExploreState`、`start_explore`／スライダーイベントハンドラ、`start_pipeline`の`DiarizeParams`分岐、Upload画面UI）、`apps/desktop/src/speaker_timeline.rs`（`playhead_ms`を`Option`化、呼び出し元1箇所を追随）。
+
+**対象外（今回は見送り）**: ドラッグ中のライブ更新（`SliderEvent::Change`ごとの再計算）——250ms/回のコストがある限り体感でラグになるため、離した時だけ計算する設計にした。必要になれば別途デバウンス機構を検討する。探索モードのしきい値そのものを確定モードに渡す案——スケール不一致のリスクがあるためユーザー判断で見送り（話者数ヒントのみ採用）。
+
+### 検証方法
+
+`cargo build --workspace`/`clippy --workspace --all-targets`、`cd apps/desktop && cargo +nightly build --all-targets`/`clippy --all-targets`の後、実機（ユーザー操作）で——(1) アップロード画面でファイルを選ぶと自動で「分析中…」→スライダー・プレビューが表示されるか (2) スライダーを動かして離すと、少し待ってからプレビューの話者色分けと人数表示が変わるか（ドラッグ中は変わらなくてよい） (3) 「処理を開始」を押すと、探索モードで見た人数がヒントとして使われ、実際の話者分離結果の人数と近くなるか（多少のズレは許容——確定モード自身のクラスタリングも働く） (4) 探索がまだ終わっていない/失敗した状態で「処理を開始」を押しても、今まで通り問題なく動くか (5) 別のファイルを選び直した時に、古いファイルの解析結果が紛れ込まないか。
+
+**実装状況**: 実装済み。`asr-core`側は無変更（既存の`diarize::fast::{FastModelPaths, WindowParams, build_embedding_cache, recluster}`・`diarize::merge_same_speaker_runs`をそのまま利用）。`apps/desktop/src/bin/app.rs`に`ExploreState`（`Idle`/`Building`/`Ready`/`Failed`）＋`UploadScreen.explore`、`start_explore`（`pick_media`成功時に自動起動、`spawn_dedicated`で埋め込みキャッシュ構築＋初期しきい値0.3での再クラスタリング）、`recluster_explore`（スライダーの`SliderEvent::Release`で発火、`generation`カウンタで古い結果を破棄）、`start_pipeline`での`DiarizeParams`分岐（探索結果があれば`num_speakers`をヒントとして渡す、無ければ従来通り`::default()`）を追加。UIは「音声/動画を選ぶ」と「処理を開始」の間に、分析中の表示／検出話者数ラベル＋スライダー＋`speaker_timeline()`を再利用したプレビュー／失敗時の非ブロッキングなエラー表示を追加。`apps/desktop/src/speaker_timeline.rs`の`playhead_ms`を`Option<u64>`化（このプレビュー画面には実`Transport`が無いため）し、唯一の呼び出し元（実エディタ）を追随。
+
+**追記（事前解析のスキップ、v1: 撤回）**: 最初に「分析中…」表示の隣に「スキップ」リンク（解析途中でキャンセルする経路）を追加したが、ユーザーからのフィードバックで「解析途中でスキップできるようにするんじゃなく、処理自体をスキップできるようにチェックボックスなどを用意したい」と訂正——単発のキャンセルボタンではなく、事前に立てておく恒常的なオプトインの意図だった。
+
+**追記（事前解析のスキップ、v2: 採用）**: `UploadScreen`に`skip_explore: bool`フィールドを追加し、「音声/動画を選ぶ」ボタンの下に`Checkbox`（`gpui_kit::component::checkbox::Checkbox`、`Slider`/`Progress`と同じ`gpui-component`由来）で「話者数の事前分析をスキップする」を常時表示——ファイルを選ぶ前でも後でもいつでもON/OFFできる。`pick_media`は`upload.skip_explore`がtrueなら`start_explore`を呼ばない。`set_skip_explore`（新規、旧`skip_explore`メソッドをリネーム・拡張）はON時に現在の`explore`を`Idle`に戻し（`ExploreState::Building(Task<()>)`が保持する`Task`のcancel-on-dropで、解析中でも実際に計算を中断——このためのTask保持機構自体はv1から流用）、OFF時にファイル選択済みかつ未解析（`Idle`）なら`start_explore`を即座に呼び直す（チェックを外したのにファイルを選び直す手間を無くすため）。「分析中…」表示自体からは個別のスキップリンクを撤去。
+
+`cargo build --workspace`/`clippy --workspace --all-targets`、`cd apps/desktop && cargo +nightly build --all-targets`/`clippy --all-targets`とも警告・エラーゼロ。起動スモークテスト（引数無し→プロジェクト一覧）でクラッシュ無し確認済み。モデルファイル（`silero_vad.onnx`・`3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`）は`models/`に存在確認済み。
+
+**確認済み**: ユーザーが実機で操作し完了を確認（チェックボックスによる事前分析スキップ機能も含む）。
+
+---
+
 ## 未検証のまま残っている項目
 
 Azure関連の項目は削除——Azure AI Speechは対応しない方針に確定したため。
@@ -766,3 +836,88 @@ ElevenLabsのプラン別STT同時実行数・日本語での埋め込みモデ�
 
 
 （`timestretch`は再生エンジンの選択式対応として一度実装したが、ユーザー判断により撤回——上記「再生エンジンの選択式対応（signalsmith-stretch / timestretch）—実装したが撤回済み」参照。）
+
+---
+
+## 今回の対応範囲：セグメントリストのスクロール性能（再調査・再修正）
+
+### Context
+
+前回（`Rc<Vec<TranscriptSegment>>`化・`SegmentBlock`分離・話者カウントの1パス化）の対応は、ユーザーの実機確認で「全く解消していない、むしろ悪化してるまである」と判明済み（上記「実機検証待ち」セクション参照）。Explore agentで実コードを再調査し、前回見落としていた真因を特定した。
+
+### 調査で判明した真因
+
+前回の修正（クローンコストの削減）はどれも的外れではなかったが、**もっと大きい、前回全く手を付けていなかったコストが2つ、同じ場所に残っていた**:
+
+1. **`timeline_ruler()`（`apps/desktop/src/speaker_timeline.rs:169-194`）が録音の全長を`0`からティック間隔（`nice_tick_interval_secs`で決まる、既定ズームでは2秒間隔）で刻んだ分だけの`div()`を毎回作っている**——ストレステストデータ（3000セグメント、約2時間53分）では**1回のrenderで5,202個の`div()`＋5,202回の`String`確保＋テキストシェイピング**が発生する。通常データ（51セグメント・約3分50秒）では116個で、ここが**セグメント数ではなく録音の長さ×ズーム倍率に比例して爆発する**、前回の分析では完全に見落としていた箇所。ズームを上げるとさらに悪化する（最大ズームでは10,403個）。
+2. **`speaker_timeline()`（同ファイル`:64-152`）のcanvasペイント処理が、渡された`segments`全件について`window.paint_quad`を呼んでいる**（`:79-87`）——ビューポート外（画面に映っていない範囲）のセグメントも一切間引かれず、3000セグメントなら3000回のペイント呼び出しが毎回発生する。呼び出し元（`app.rs:2360-2368`）でも、渡す`Vec<SegmentBlock>`をその場で3000要素分アロケートし直している。
+
+そして両方とも**`EditorScreen::render()`内で無条件に呼ばれており**（`app.rs:2357`のruler呼び出し、`:2359`のtimeline呼び出し）、**セグメントリスト側のスクロールで`cx.notify()`が飛ぶたびに、無関係なはずのタイムライン部分も丸ごと再構築・再ペイントされる**（`gpui::list`のスクロール通知は`EditorScreen`エンティティ全体に対して飛ぶため、両者の間に別Entityの境界が無く、re-renderを止める仕組みが無い——`app.rs`内の`last_centered_playhead_ms`/`last_highlighted_ix`が「スクロールでrenderが再実行されてしまう」ことへの既存の対策として存在している点からも裏付けられる）。前回の修正はこの2つのどちらにも触れていなかったため、体感速度が変わらなかった。
+
+### 設計
+
+**核心**: タイムライン用のスクロールコンテナ（`self.timeline_scroll`、既存のScrollHandle）から「今画面に映っている時間範囲」を1回だけ計算し、(a) `speaker_timeline()`に渡す`Vec<SegmentBlock>`をその範囲でフィルタしてから渡す（＝ペイント回数もアロケーション量も可視分だけに削減）、(b) `timeline_ruler()`にもその範囲を渡し、範囲外のティックは作らない、の2点に絞る。`gpui::list`の仮想化と同じ「見えている分＋オーバードロー余白だけ処理する」考え方を、タイムライン側にも適用する。
+
+1. **`EditorScreen`に「現在画面に映っている時間範囲」を求めるヘルパーを追加**（新規メソッド、例: `fn visible_timeline_range_ms(&self) -> Option<(u64, u64)>`）。既存の2つのフィールドだけで計算できることを直接コードを読んで確認済み——半端なパディング計算を自前で再導出する必要は無い:
+   - `self.timeline_bounds: Rc<Cell<Bounds<Pixels>>>`（`speaker_timeline`のcanvasが毎回書き込む、画面上の実描画位置。`t=0`が画面上のどのx座標に来ているかを表す。既に`seek_to_timeline_x`がクリック位置の変換に使っている「スクロール補正済みの原点」）
+   - `self.timeline_scroll.bounds()`（スクロールコンテナ自体の画面上の矩形＝現在見えているビューポート。`center_timeline_playhead`が同じ値を使っている）
+   
+   `visible_start_px = timeline_scroll.bounds().origin.x - timeline_bounds.get().origin.x`、`visible_end_px = visible_start_px + timeline_scroll.bounds().size.width`を求め、`/ pixels_per_second`で秒に変換、オーバードロー余白（`gpui::list`が使っている400px相当の考え方を踏襲、具体的な余白量は実装時に決める）を前後に足す。`timeline_bounds`は1フレーム遅れ（直前フレームの描画結果）だが、オーバードロー余白があるので実用上問題ない——`seek_to_timeline_x`も同じ前提で動いている。初回レイアウト前（`timeline_scroll.bounds().size.width <= px(0.0)`、`center_timeline_playhead`と同じガード）は`None`を返し、呼び出し側はその場合「まだ絞り込めないので今回は全件」にフォールバックする。
+2. **`app.rs`の`speaker_timeline()`呼び出し直前**（`:2360-2368`付近）——`hidden_speakers`によるフィルタに加えて、`visible_timeline_range_ms()`で絞った範囲と重なるセグメントだけを`SegmentBlock`化する。`speaker_timeline()`自身（`speaker_timeline.rs`）は変更不要——渡されるVecが最初から小さくなるので、ペイント回数もアロケーション量もそのまま減る。
+3. **`timeline_ruler()`のシグネチャに可視範囲パラメータを追加**（`apps/desktop/src/speaker_timeline.rs:161-186`、唯一の呼び出し元は`app.rs:2357`のみなので影響範囲は小さい）——ループの開始・終了を`0..total_secs`ではなく、渡された可視範囲（＋オーバードロー）に絞る。コンテナ自体の幅（`timeline_content_width`）は録音全長のままで変えない（スクロール可能範囲は維持、間引くのは中身のティックだけ）。
+
+### 対象外（今回は見送り、必要になれば次の一手）
+
+- **タイムライン部分を別Entityに切り出し、セグメントリストのスクロール通知そのものから完全に独立させる**構造的な対策（Explore agentの提案では最も根本的だが、最も変更が大きい）。今回はカリング（見えている分だけ処理する）だけで実測上十分改善するはずという判断で見送るが、**もし今回の対策後もまだ改善しないとユーザーが報告した場合は、次にこちらに着手する**——「カリングだけでは足りなかった」という新しい情報が得られたことになるため。
+- ズーム時の可視範囲再計算の細かいチューニング（オーバードロー幅の最適値など）——実機の体感を見てから微調整する。
+
+### 検証方法
+
+1. `cd apps/desktop && cargo +nightly build --bin app` / `clippy --bin app --all-targets`——警告・エラーゼロ。
+2. 起動スモークテスト（`debug-data/pipeline_transcript_stress.json`3000件・通常の51件データ）でクラッシュ無し。
+3. **実機での体感確認（ユーザー、必須——前回「直った」と報告して実際は直っていなかった経緯があるため、今回は特に慎重に確認をお願いする）**——(1) 3000件データでセグメントリストをスクロールした時の滑らかさが明確に改善しているか (2) タイムライン自体のズーム・水平スクロール・クリックシーク・ループIN/OUT表示・プレイヘッド追従が今まで通り正しく動くか（可視範囲の計算を間違えるとタイムラインの表示自体が壊れるリスクがあるため） (3) 通常の51件データで見た目・動作に変化が無いか (4) それでもまだ重いと感じる場合は、その旨を報告してもらい、上記「対象外」の構造的な対策に進む。
+
+**実装状況**: 実装済み。`EditorScreen`に`visible_timeline_range_ms()`を新設——既存の`timeline_bounds`（キャンバスの直前フレーム描画位置、`seek_to_timeline_x`が使っているのと同じ）と`timeline_scroll.bounds()`（スクロールコンテナの実ビューポート矩形、`center_timeline_playhead`が使っているのと同じ）の2つの既存フィールドだけから可視時間範囲（前後5秒のオーバードロー付き）を算出——新規のスクロール追跡状態は追加していない。`render()`でこの範囲を1回計算し、(a) `speaker_timeline()`に渡す`SegmentBlock`のフィルタ条件に追加（`hidden_speakers`と同じ`.filter()`チェーンに追加、可視範囲外のセグメントはVec構築の時点で除外——`speaker_timeline.rs`自体は無変更）、(b) `timeline_ruler()`の新しい`visible_range_ms: Option<(u64,u64)>`引数として渡す（`speaker_timeline.rs`側でティック生成ループの開始・終了をこの範囲に絞る、`None`の場合は従来通り全件——呼び出し元は1箇所のみなので影響範囲は限定的）。
+
+`cd apps/desktop && cargo +nightly build --all-targets`/`clippy --all-targets`、`cargo build --workspace`/`clippy --workspace --all-targets`とも警告・エラーゼロ。起動スモークテスト2パターン（3000件のストレスデータ・通常の51件データ）でクラッシュ無し確認済み。
+
+**確認済み**: ユーザーが実機で操作し、「パフォーマンスは解消されました」と確認済み。
+
+## 今回の対応範囲：セグメントリストのスクロールバーのサイズを初期表示から正確にする
+
+### Context
+
+スクロール性能の修正は確認済みだが、その確認の過程でユーザーから新しい指摘: 「スクロールバーが少しずつ小さくなっていく（要素がどんどん増えていく）様子」——スクロールしていくとスクロールバーのつまみ（thumb）がだんだん縮んでいく。「スクロールバーは最初から全件分を想定した状態にしたい」とのこと。
+
+**原因**: `gpui::list`/`ListState`は可変行高に対応するため、実際に画面に表示（または`ListState::new`の第3引数`overdraw`＝400pxの余白分だけ先読み）された行だけを実測し、まだ一度も表示されていない行は高さ不明のまま扱う（`gpui-pre-0.3.4/src/elements/list.rs`で確認済み）。スクロールバーのつまみの大きさは「実測済みの合計高さに対する表示範囲の比率」から計算されるため、スクロールが進んで今まで見えていなかった行が新たに実測されるたびに、合計高さの見積もりが変わり、つまみのサイズが変動する——ユーザーが見た「だんだん小さくなっていく」はこれで説明できる（実測が進むほど、合計の見積もりが正確な値に近づいていく＝多くの場合サイズが縮む方向に補正される）。
+
+**対応**: `gpui::list`自体に、まさにこの問題向けの機能がある——`ListState::with_uniform_item_height(height: Pixels)`（構築時のビルダーメソッド）。「未実測の行に一律の高さヒントを与えておき、実際にレンダリングされた行から順に本当の高さへ置き換わっていく」という仕組みで、doc commentにも「the scrollbar thumb is correctly sized from the first frame」と明記されている、まさにこのための機能。
+
+### 設計
+
+1. `apps/desktop/src/bin/app.rs`に行高の見積もり定数を追加（例: `const ESTIMATED_ROW_HEIGHT: Pixels = px(64.0);`、`ROW_TEXT_SIZE`の近くに配置）。値は行の構造（ヘッダー行＋本文1〜2行＋上下パディング＋区切り線）から見積もった概算——セグメントの本文は複数行に折り返すこともあるため厳密な値は出せず、あくまで「スクロールバーが違和感の無いサイズで安定する」ための近似値。実機で見て大きくズレているようなら、この1箇所の数値を調整するだけで済む。
+2. `ListState::new(...)`を呼んでいる5箇所全て（`apps/desktop/src/bin/app.rs`の4箇所——`self.list_state = ListState::new(...)`、行番号は実装時に`grep`で再確認——と`build_editor_entity`内の初期構築1箇所）に`.with_uniform_item_height(ESTIMATED_ROW_HEIGHT)`を追加するだけ。他のロジックは変更不要。
+
+**対象外（今回は見送り）**: `ListState::measure_all()`（全行を初回レイアウトで実測、より正確だが重い——今回の目的には`with_uniform_item_height`で十分）。
+
+### 検証方法
+
+1. `cd apps/desktop && cargo +nightly build --bin app` / `clippy --bin app --all-targets`——警告・エラーゼロ。
+2. 起動スモークテスト（3000件のストレスデータ・通常の51件データ）でクラッシュ無し。
+3. **実機確認（ユーザー）**——(1) 3000件データを開いた直後、スクロールする前からスクロールバーのつまみが「全件分を想定した」妥当なサイズになっているか (2) スクロールしていってもつまみのサイズが目に見えて変動しない（前回の「だんだん小さくなる」現象が解消しているか） (3) 見積もり値と実際の行の高さがかけ離れていて、スクロール位置とつまみの動きが噛み合わない違和感が無いか（あれば`ESTIMATED_ROW_HEIGHT`を調整）。
+
+**実装の顛末（当初案は効かなかった）**: `ESTIMATED_ROW_HEIGHT`＋`.with_uniform_item_height(...)`を5箇所に追加する当初案を実装したが、ユーザーが実機で確認したところ「まだ最初に表示されている要素分の高さしか確保していない様子（全く変わっていない）」と判明。一時的な診断出力（`eprintln!`、確認後に削除済み）でその場で原因を特定した:
+
+- **真因**: `gpui-pre-0.3.4`自身の`List::prepaint`（`gpui-pre-0.3.4/src/elements/list.rs:1543-1558`）が、**そのリストが一度もレイアウトされていない場合（`last_layout_bounds.is_none()`）を「幅が変わった」と同じ扱いにし、全アイテムの高さヒントを問答無用で`None`に戻してしまう**——`with_uniform_item_height`で構築直後に設定したヒントは、そのリストの**最初のレイアウトパスで即座に消される**。診断出力で実測: 構築直後は`max_offset_for_scrollbar()`が正しく`192000px`（3000件×64px）だったのに、次のrenderでは`402px`（可視分の実測値のみ）まで落ちていた。
+- **なぜ`measure_all()`ではなく再適用にしたか**: `ListState::measure_all()`（全件を初回レイアウトで実測、doc comment曰く「大きいリストの初回フレームでは高コスト」）も検討したが、`layout_all_items`の実装（`list.rs:985-1025`）を読むと**行ごとの`render_item`クロージャを実際に呼び出す**——このアプリは`list_state`を分割・結合・削除・話者統合・Undo/Redoのたびに`ListState::new(...)`で作り直しているため、`measure_all()`を使うと**編集操作のたびに全3000行分の実レンダリングが走る**ことになり、今回直したかったスクロールジャンクとは別種の重さを毎編集操作に持ち込むリスクがあると判断し見送った。
+- **採用した対策**: `EditorScreen`に`list_needs_height_hint_reapply: bool`を追加（`list_state`を作り直す5箇所全てで`true`にする）。`render()`の先頭で、`list_state.viewport_bounds().size.height > px(0.0)`（＝実際に一度でもレイアウトされた後）になった最初のタイミングで`.with_uniform_item_height(ESTIMATED_ROW_HEIGHT)`を**再適用**し、フラグを`false`に戻す。`ListState`は内部が`Rc<RefCell<_>>`なので`self.list_state.clone().with_uniform_item_height(...)`で同じ実体を更新できる（新しいハンドルを作るだけで、`self.list_state`自体の再代入は不要）。この再適用1回だけのコストは「アイテムのメタデータをVecに詰め直す」程度（`render_item`は一切呼ばない）で、`measure_all()`のような重さは無い。診断出力で、再適用直後に`max_offset_for_scrollbar()`が`191186px`まで正しく回復し、以降のスクロールでは（実測が進むにつれ）`191234px→194238px`のように**小さく緩やかに収束**する（当初の「ほぼゼロから際限なく増え続ける」壊れた挙動とは全く違う、想定通りの挙動）ことを確認済み。
+
+`cd apps/desktop && cargo +nightly build --all-targets`/`clippy --all-targets`、`cargo build --workspace`/`clippy --workspace --all-targets`とも警告・エラーゼロ。起動スモークテスト2パターン（3000件のストレスデータ・通常の51件データ）でクラッシュ無し確認済み。診断出力は確認後に削除済み（作業ツリーに残っていない）。
+
+**確認済み**: ユーザーが実機で操作し「今開いているのいい感じー」と確認済み。
+
+---
+
+## 保留：UIの刷新
+
+ユーザー確認済みの方針（テーマ/部品ライブラリの本格採用・アイコン導入・Settings画面から段階展開）だが、**セグメントリストのスクロール性能問題を先に片付けるべき**との判断で保留。詳細は[UI_POLISH.md](../UI_POLISH.md)参照。

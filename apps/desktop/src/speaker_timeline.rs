@@ -49,10 +49,12 @@ pub fn timeline_content_width(total_duration_ms: u64, pixels_per_second: f32) ->
     px((total_duration_ms as f32 / 1000.0 * pixels_per_second).max(1.0))
 }
 
-/// Renders `segments` as colored blocks plus a playhead line, sized to the
-/// FULL recording length at `pixels_per_second` (not clamped to the
+/// Renders `segments` as colored blocks plus an optional playhead line, sized
+/// to the FULL recording length at `pixels_per_second` (not clamped to the
 /// viewport) — this must live inside a horizontally scrolling container
-/// (see `app.rs`'s timeline row).
+/// (see `app.rs`'s timeline row). `playhead_ms: None` skips the playhead line
+/// entirely -- for callers with no live `Transport` behind them (e.g. the
+/// pre-pipeline speaker-count preview on the upload screen).
 ///
 /// Writes its own painted `Bounds` into `painted_bounds` on every paint, so
 /// a mouse-down handler on the wrapping div can recover the on-screen
@@ -63,7 +65,7 @@ pub fn speaker_timeline(
     segments: Vec<SegmentBlock>,
     total_duration_ms: u64,
     pixels_per_second: f32,
-    playhead_ms: u64,
+    playhead_ms: Option<u64>,
     loop_start_ms: Option<u64>,
     loop_end_ms: Option<u64>,
     painted_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -129,13 +131,19 @@ pub fn speaker_timeline(
                 }
             }
 
-            // Painted last so it's always on top of the speaker blocks.
-            let playhead_x = playhead_ms as f32 / 1000.0 * pixels_per_second;
-            let playhead_bounds = Bounds {
-                origin: point(bounds.origin.x + px(playhead_x), bounds.origin.y),
-                size: size(px(2.0), px(height_px)),
-            };
-            window.paint_quad(fill(playhead_bounds, rgb(0xffffff)));
+            // Painted last so it's always on top of the speaker blocks. `None`
+            // means "no live transport behind this timeline" (e.g. the
+            // pre-pipeline speaker-count preview on the upload screen) --
+            // there's no playhead position to speak of, so skip it entirely
+            // rather than drawing a misleading line at some arbitrary spot.
+            if let Some(playhead_ms) = playhead_ms {
+                let playhead_x = playhead_ms as f32 / 1000.0 * pixels_per_second;
+                let playhead_bounds = Bounds {
+                    origin: point(bounds.origin.x + px(playhead_x), bounds.origin.y),
+                    size: size(px(2.0), px(height_px)),
+                };
+                window.paint_quad(fill(playhead_bounds, rgb(0xffffff)));
+            }
         },
     )
     .flex_none()
@@ -158,7 +166,19 @@ fn nice_tick_interval_secs(target_px: f32, pixels_per_second: f32) -> u64 {
 /// canvas's coordinate space (`x = seconds * pixels_per_second`), so they
 /// scroll and zoom in lockstep with the segment blocks. 70px is the target
 /// label spacing from the reference HTML.
-pub fn timeline_ruler(total_duration_ms: u64, pixels_per_second: f32) -> impl IntoElement {
+///
+/// `visible_range_ms` (with overdraw margin -- see
+/// `EditorScreen::visible_timeline_range_ms`'s doc comment) limits which
+/// ticks actually get built as elements: at recording-length scale, ticking
+/// the *entire* recording every render regardless of scroll position was a
+/// real, previously-missed cost (a ~2h53m/3000-segment stress recording
+/// produced 5,202 tick `div`s per render). `None` renders every tick from 0
+/// -- used by callers with no scroll viewport to cull against.
+pub fn timeline_ruler(
+    total_duration_ms: u64,
+    pixels_per_second: f32,
+    visible_range_ms: Option<(u64, u64)>,
+) -> impl IntoElement {
     let tick_sec = nice_tick_interval_secs(70.0, pixels_per_second);
     let total_secs = total_duration_ms / 1000;
 
@@ -168,8 +188,14 @@ pub fn timeline_ruler(total_duration_ms: u64, pixels_per_second: f32) -> impl In
         .w(timeline_content_width(total_duration_ms, pixels_per_second))
         .h(px(18.0));
 
-    let mut t = 0u64;
-    while t <= total_secs {
+    // Snap the start down to a tick boundary so which labels appear doesn't
+    // shift as the visible window scrolls.
+    let (range_start_secs, range_end_secs) = match visible_range_ms {
+        Some((start_ms, end_ms)) => (start_ms / 1000, (end_ms / 1000).min(total_secs)),
+        None => (0, total_secs),
+    };
+    let mut t = (range_start_secs / tick_sec) * tick_sec;
+    while t <= range_end_secs {
         let tick_x = t as f32 * pixels_per_second;
         row = row.child(
             div()

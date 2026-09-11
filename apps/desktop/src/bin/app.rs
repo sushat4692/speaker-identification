@@ -13,18 +13,21 @@
 //! flagged as having no known GPUI precedent at the time.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asr_audio::{PlaybackRate, Transport};
 use asr_core::pipeline::TranscriptSegment;
 use gpui_kit::base::{Align, ElementExt as _, Placement, Positioner, POPUP_PRIORITY};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Escape, Input, InputState, Position, RopeExt as _, Textarea, TextareaState};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::Scrollbar;
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::Root;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _, *};
@@ -36,6 +39,20 @@ use desktop::speaker_timeline::{speaker_color, speaker_timeline, timeline_conten
 /// into edit mode doesn't visibly shrink its font — `Textarea`'s own default
 /// (`Size::Medium` -> `.text_sm()`) is smaller than plain `div` text.
 const ROW_TEXT_SIZE: Pixels = px(14.0);
+
+/// Uniform-height hint for the segment list's `ListState` (see
+/// `ListState::with_uniform_item_height`'s doc comment) -- without this,
+/// only rows that have actually scrolled into view (or into the 400px
+/// overdraw margin) get measured, so the scrollbar thumb's size is computed
+/// from a growing-but-incomplete total height and visibly shrinks as more
+/// rows get measured while scrolling (reported by the user after the
+/// scroll-jank fix above). This is a rough estimate (header line + ~1-2
+/// lines of wrapped body text + padding + divider) for a row that hasn't
+/// been measured yet -- real rows vary since segment text wraps to a
+/// different number of lines, so this only needs to keep the thumb roughly
+/// stable, not pixel-exact. Adjust this one constant if it looks off in
+/// practice (e.g. rows wrap to more lines on average than assumed here).
+const ESTIMATED_ROW_HEIGHT: Pixels = px(64.0);
 
 
 // `Cmd`-based keymap (see docs/plan.md's "Cmdベースのキーマップ" section).
@@ -265,6 +282,27 @@ struct EditorScreen {
     segments: Rc<Vec<TranscriptSegment>>,
     total_duration_ms: u64,
     list_state: ListState,
+    /// Whether `list_state`'s `.with_uniform_item_height(ESTIMATED_ROW_HEIGHT)`
+    /// hint (applied at construction, see every `ListState::new(...)` call
+    /// site) still needs to be *reapplied* once `list_state` has actually
+    /// been laid out for the first time. Necessary because `gpui-pre`'s own
+    /// `List::prepaint` unconditionally wipes every item's size hint back to
+    /// `None` on its first-ever layout pass (`last_layout_bounds.is_none()`
+    /// is treated the same as "width changed", `gpui-pre-0.3.4/src/elements/
+    /// list.rs:1543-1558`) -- discovered by a temporary diagnostic print
+    /// showing the scrollbar's `max_offset_for_scrollbar()` go from the
+    /// correct hinted total (`item_count * ESTIMATED_ROW_HEIGHT`) on the
+    /// very first `render()` down to just the initially-visible rows' real
+    /// height on the very next one. Re-applying the hint is cheap (just
+    /// relabels the `ListState`'s internal metadata, doesn't invoke
+    /// `render_item` the way `ListState::measure_all()` would for every
+    /// item), so doing it once, right after the first real layout, is far
+    /// cheaper than either leaving the bug in place or reaching for
+    /// `measure_all()` (which the library's own doc comment warns is
+    /// expensive precisely because it *does* render every item up front --
+    /// unacceptable here since `list_state` gets reconstructed on every
+    /// split/merge/delete/undo/redo, not just once at open).
+    list_needs_height_hint_reapply: bool,
     focused_row: Option<usize>,
     editor: Option<Entity<TextareaState>>,
     /// Fires when `editor`'s own `TextareaState` loses real GPUI window
@@ -623,7 +661,8 @@ impl EditorScreen {
         segments.insert(ix + 1, second);
         self.dirty = true;
 
-        self.list_state = ListState::new(self.segments.len(), ListAlignment::Top, px(400.0));
+        self.list_state = ListState::new(self.segments.len(), ListAlignment::Top, px(400.0)).with_uniform_item_height(ESTIMATED_ROW_HEIGHT);
+        self.list_needs_height_hint_reapply = true;
         // Not `commit_focused()`: it would read the *old*, still-live
         // Textarea's full (unsplit) text and clobber the split we just
         // wrote into `segments[ix]` above. The old editor is stale now --
@@ -661,7 +700,8 @@ impl EditorScreen {
         prev.text = format!("{}{}", prev.text, current.text);
         self.dirty = true;
 
-        self.list_state = ListState::new(self.segments.len(), ListAlignment::Top, px(400.0));
+        self.list_state = ListState::new(self.segments.len(), ListAlignment::Top, px(400.0)).with_uniform_item_height(ESTIMATED_ROW_HEIGHT);
+        self.list_needs_height_hint_reapply = true;
         self.focus_row(ix - 1, window, cx);
     }
 
@@ -846,6 +886,47 @@ impl EditorScreen {
     /// (false before the first layout pass, when `viewport.size.width` is
     /// still zero) so the caller's memoization (see `render()`) doesn't
     /// wrongly record "already centered" and then never retry.
+    /// Recording-time range (ms), with overdraw slack on each side,
+    /// currently visible in the timeline's scroll viewport -- or `None`
+    /// before the first layout pass. Used to cull `timeline_ruler`'s ticks
+    /// and `speaker_timeline`'s segment blocks down to roughly what's on
+    /// screen, instead of building/painting one element per tick/segment
+    /// for the *entire* recording on every render regardless of scroll
+    /// position -- this, not segment-count-driven allocation, turned out to
+    /// be the real O(recording length × zoom) cost behind the scroll jank
+    /// (see docs/plan.md's "セグメントリストのスクロール性能" section):
+    /// a 3000-segment/~2h53m stress recording was producing 5,202 ruler-tick
+    /// `div`s and 3,000 `paint_quad` calls on *every* render, including ones
+    /// triggered by scrolling the unrelated segment list below.
+    ///
+    /// Built from two fields that already exist for other reasons, so no
+    /// new scroll-tracking state is needed: `timeline_bounds` (the timeline
+    /// canvas's own last-painted screen position -- already scroll-corrected,
+    /// the same one `seek_to_timeline_x` uses to convert a click position)
+    /// and `timeline_scroll.bounds()` (the scroll container's fixed
+    /// viewport rectangle, the same one `center_timeline_playhead` uses).
+    /// `timeline_bounds` is one frame stale (this frame hasn't painted yet),
+    /// which is harmless here -- the overdraw margin absorbs it, exactly as
+    /// `seek_to_timeline_x` already tolerates the same staleness for click
+    /// handling.
+    fn visible_timeline_range_ms(&self) -> Option<(u64, u64)> {
+        let viewport = self.timeline_scroll.bounds();
+        if viewport.size.width <= px(0.0) {
+            return None; // no layout yet
+        }
+        let canvas_origin_x = self.timeline_bounds.get().origin.x;
+        let visible_start_px = (viewport.origin.x - canvas_origin_x).max(px(0.0));
+        let visible_end_px = visible_start_px + viewport.size.width;
+
+        // A few seconds of slack on each side so ticks/blocks don't pop in
+        // right at the edge while scrolling (mirrors the spirit of
+        // `gpui::list`'s own overdraw margin for the segment list).
+        const OVERDRAW_MS: u64 = 5_000;
+        let start_ms = (f32::from(visible_start_px) / self.pixels_per_second * 1000.0) as u64;
+        let end_ms = (f32::from(visible_end_px) / self.pixels_per_second * 1000.0) as u64;
+        Some((start_ms.saturating_sub(OVERDRAW_MS), (end_ms + OVERDRAW_MS).min(self.total_duration_ms)))
+    }
+
     fn center_timeline_playhead(&self, playhead_ms: u64) -> bool {
         let viewport = self.timeline_scroll.bounds();
         if viewport.size.width <= px(0.0) {
@@ -1003,7 +1084,8 @@ impl EditorScreen {
                 self.focused_row = Some(f - 1);
             }
         }
-        self.list_state = ListState::new(self.segments.len(), ListAlignment::Top, px(400.0));
+        self.list_state = ListState::new(self.segments.len(), ListAlignment::Top, px(400.0)).with_uniform_item_height(ESTIMATED_ROW_HEIGHT);
+        self.list_needs_height_hint_reapply = true;
         cx.notify();
     }
 
@@ -1135,7 +1217,8 @@ impl EditorScreen {
         }
         self.focused_row = None;
         self.editor = None;
-        self.list_state = ListState::new(self.segments.len(), ListAlignment::Top, px(400.0));
+        self.list_state = ListState::new(self.segments.len(), ListAlignment::Top, px(400.0)).with_uniform_item_height(ESTIMATED_ROW_HEIGHT);
+        self.list_needs_height_hint_reapply = true;
         self.highlighted_row = changed_row;
         if let Some(ix) = changed_row {
             self.list_state.scroll_to_reveal_item(ix);
@@ -1210,6 +1293,19 @@ impl EditorScreen {
 
 impl Render for EditorScreen {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Re-apply the segment list's uniform-item-height scrollbar hint
+        // once its first real layout has happened -- see
+        // `list_needs_height_hint_reapply`'s doc comment for why a single
+        // reapply here is necessary (gpui-pre's own `List::prepaint` wipes
+        // the hint applied at construction on its first-ever layout pass)
+        // and why this is cheap enough to just check on every render
+        // (skipped entirely once the flag clears, and even while set, this
+        // does nothing until `viewport_bounds()` reports a real, laid-out
+        // size instead of the pre-layout default).
+        if self.list_needs_height_hint_reapply && self.list_state.viewport_bounds().size.height > px(0.0) {
+            self.list_state.clone().with_uniform_item_height(ESTIMATED_ROW_HEIGHT);
+            self.list_needs_height_hint_reapply = false;
+        }
         // Whenever nothing holds focus (initial mount, or a Textarea just
         // gave it up -- e.g. `commit_focused`), claim it for our own
         // container so the keymap's `.on_action(...)` handlers have
@@ -2313,6 +2409,12 @@ impl Render for EditorScreen {
                                         }
                                     })
                                     .child({
+                                // Cull the ruler's ticks and the timeline's
+                                // segment blocks to roughly what's on screen
+                                // -- see `visible_timeline_range_ms`'s doc
+                                // comment for why this (not segment count)
+                                // was the real scroll-jank cost at scale.
+                                let visible_range_ms = self.visible_timeline_range_ms();
                                 // Half a viewport's worth of padding on each
                                 // side, so the playhead can be scrolled all
                                 // the way to dead-center even at t=0 or the
@@ -2351,12 +2453,16 @@ impl Render for EditorScreen {
                                             .flex()
                                             .flex_col()
                                             .w(content_width)
-                                            .child(timeline_ruler(self.total_duration_ms, self.pixels_per_second))
+                                            .child(timeline_ruler(self.total_duration_ms, self.pixels_per_second, visible_range_ms))
                                             .child(
                                                 div().flex_none().h(px(28.0)).child(speaker_timeline(
                                                     self.segments
                                                         .iter()
                                                         .filter(|s| !self.hidden_speakers.contains(&s.speaker))
+                                                        .filter(|s| match visible_range_ms {
+                                                            Some((start, end)) => s.end_ms >= start && s.start_ms <= end,
+                                                            None => true,
+                                                        })
                                                         .map(|s| SegmentBlock {
                                                             speaker: s.speaker,
                                                             start_ms: s.start_ms,
@@ -2365,7 +2471,7 @@ impl Render for EditorScreen {
                                                         .collect(),
                                                     self.total_duration_ms,
                                                     self.pixels_per_second,
-                                                    playhead_ms,
+                                                    Some(playhead_ms),
                                                     self.loop_start_ms,
                                                     self.loop_end_ms,
                                                     self.timeline_bounds.clone(),
@@ -2423,7 +2529,7 @@ fn build_editor_entity(
     cx: &mut App,
 ) -> Entity<EditorScreen> {
     let total_duration_ms = segments.iter().map(|s| s.end_ms).max().unwrap_or(0);
-    let list_state = ListState::new(segments.len(), ListAlignment::Top, px(400.0));
+    let list_state = ListState::new(segments.len(), ListAlignment::Top, px(400.0)).with_uniform_item_height(ESTIMATED_ROW_HEIGHT);
     cx.new(|cx| {
         // Periodic refresh: the playhead only needs to actually move (and
         // thus repaint) while playing -- `is_playing` itself flips inside
@@ -2463,6 +2569,7 @@ fn build_editor_entity(
             segments: Rc::new(segments),
             total_duration_ms,
             list_state,
+            list_needs_height_hint_reapply: true,
             focused_row: None,
             editor: None,
             editor_blur_subscription: None,
@@ -2518,6 +2625,53 @@ enum UploadStatus {
     Failed(String),
 }
 
+/// Fast/exploratory diarization ("探索モード", `asr_core::diarize::fast`),
+/// run automatically once a media file is picked, before the real (slow,
+/// paid) pipeline starts -- lets the user see roughly how many distinct
+/// speakers the recording seems to have via a live threshold slider, before
+/// committing to a real run. See docs/plan.md's "話者分離「探索モード」の
+/// UI配線" section for the full design and why this only ever *hints*
+/// (via `DiarizeParams.num_speakers`) rather than blocks or replaces the
+/// confirmed-mode run in `start_pipeline`.
+enum ExploreState {
+    /// No media picked yet, or the analysis was skipped/reset -- either way,
+    /// `start_pipeline` falls back to `DiarizeParams::default()`.
+    Idle,
+    /// `build_embedding_cache` running on a dedicated background thread
+    /// (loads the VAD + embedding ONNX models -- same stack-size concern as
+    /// `start_pipeline`'s `spawn_dedicated`). Holds the outer polling
+    /// `Task` (not detached) so `skip_explore` can drop it to actually
+    /// cancel the computation instead of just ignoring its eventual result
+    /// -- `Task`'s cancel-on-drop semantics (unless `.detach()`ed) make this
+    /// as simple as overwriting the field. Never read otherwise -- kept
+    /// alive purely for its `Drop` impl.
+    Building(#[allow(dead_code)] Task<()>),
+    Ready {
+        cache: Arc<asr_core::diarize::fast::EmbeddingCache>,
+        total_duration_ms: u64,
+        slider: Entity<SliderState>,
+        /// Keeps the `SliderEvent::Release` subscription alive -- dropping
+        /// this would silently stop the slider from doing anything.
+        _slider_subscription: Subscription,
+        preview: Vec<SegmentBlock>,
+        distinct_speakers: usize,
+        /// Bumped on every recluster request so a slower/older background
+        /// result can't clobber a newer one that finished first.
+        generation: Arc<AtomicU64>,
+        painted_bounds: Rc<Cell<Bounds<Pixels>>>,
+    },
+    /// Non-fatal: exploration failing must never block "処理を開始" -- it
+    /// just means no `num_speakers` hint is available (same as `Idle`).
+    Failed(String),
+}
+
+/// Initial/default threshold for the explore slider -- matches
+/// `crates/asr-cli`'s `fast-recluster --threshold` default and
+/// `tools/diarization-viewer.html`'s slider default (both `0.3`). Not the
+/// same scale as the confirmed mode's `cluster_threshold` (default `0.9`) --
+/// see `ExploreState`'s doc comment.
+const EXPLORE_INITIAL_THRESHOLD: f32 = 0.3;
+
 /// The upload screen's own state -- a field of `AppRoot`, not a standalone
 /// `Entity`, since `AppRoot` is the single window root and just branches
 /// `render()` on `AppScreen` (see that doc comment for why, over
@@ -2530,6 +2684,13 @@ struct UploadScreen {
     project_id: String,
     media_path: Option<PathBuf>,
     status: UploadStatus,
+    explore: ExploreState,
+    /// The "話者数の事前分析をスキップする" checkbox -- an upfront opt-out
+    /// of the whole exploratory-diarization step (`start_explore`), not a
+    /// mid-analysis cancel button (that was tried first and replaced with
+    /// this per feedback: the skip should be a standing choice, not
+    /// something you can only reach while it happens to be running).
+    skip_explore: bool,
 }
 
 /// Project-list screen -- the app's actual entry point (see `main`), showing
@@ -2825,7 +2986,13 @@ impl AppRoot {
     /// "新規アップロード" on a project's detail screen -- navigates to the
     /// upload screen, scoped to this project.
     fn open_upload(&mut self, project_id: String, cx: &mut Context<Self>) {
-        self.screen = AppScreen::Upload(UploadScreen { project_id, media_path: None, status: UploadStatus::Idle });
+        self.screen = AppScreen::Upload(UploadScreen {
+            project_id,
+            media_path: None,
+            status: UploadStatus::Idle,
+            explore: ExploreState::Idle,
+            skip_explore: false,
+        });
         cx.notify();
     }
 
@@ -3065,12 +3232,12 @@ impl AppRoot {
             let Ok(Ok(Some(mut paths))) = rx.await else { return };
             let Some(path) = paths.pop() else { return };
             this.update(cx, |this, cx| {
-                let AppScreen::Upload(upload) = &mut this.screen else { return };
                 let ext_ok = path
                     .extension()
                     .and_then(|e| e.to_str())
                     .map(|e| Self::ALLOWED_EXTENSIONS.contains(&e.to_lowercase().as_str()))
                     .unwrap_or(false);
+                let AppScreen::Upload(upload) = &mut this.screen else { return };
                 if ext_ok {
                     upload.media_path = Some(path);
                     upload.status = UploadStatus::Idle;
@@ -3080,9 +3247,172 @@ impl AppRoot {
                         Self::ALLOWED_EXTENSIONS.join(", ")
                     ));
                 }
+                let skip_explore = upload.skip_explore;
                 cx.notify();
+                // Outside the `upload` borrow above (it needs `&mut
+                // this.screen` again itself) -- kick off the fast/exploratory
+                // diarization pass automatically, right when a valid media
+                // file is picked, unless the "話者数の事前分析をスキップす
+                // る" checkbox is on (see docs/plan.md's "話者分離「探索
+                // モード」のUI配線" section).
+                if ext_ok && !skip_explore {
+                    this.start_explore(cx);
+                }
             })
             .ok();
+        })
+        .detach();
+    }
+
+    /// Kicks off the fast/exploratory diarization pass ("探索モード",
+    /// `asr_core::diarize::fast`) on a dedicated OS thread (same
+    /// `spawn_dedicated` rationale as `start_pipeline`: it loads two ONNX
+    /// models, so a GCD worker's small default stack is a real risk). A
+    /// no-op if `self.screen` isn't `Upload` or no media is picked.
+    ///
+    /// Unlike `start_pipeline`, this needs no incremental progress
+    /// reporting (`build_embedding_cache` is one opaque step, not a staged
+    /// pipeline), so it just awaits the `Task` directly in one `cx.spawn`
+    /// instead of the detach-plus-`Arc<Mutex<_>>`-polling pattern
+    /// `start_pipeline` uses for `PipelineStage` updates.
+    fn start_explore(&mut self, cx: &mut Context<Self>) {
+        let AppScreen::Upload(upload) = &mut self.screen else { return };
+        let Some(media_path) = upload.media_path.clone() else { return };
+
+        let expected_media_path = media_path.clone();
+        let task = cx.background_executor().spawn_dedicated(move |_executor| async move {
+            let result: anyhow::Result<(asr_core::diarize::fast::EmbeddingCache, u64, Vec<asr_core::diarize::SpeakerSegment>)> =
+                (|| {
+                    let samples = asr_core::audio::load_for_pipeline(&media_path)?;
+                    let total_duration_ms = (samples.len() as f64 / asr_core::audio::TARGET_SAMPLE_RATE as f64
+                        * 1000.0)
+                        .round() as u64;
+                    let models_dir = PathBuf::from(AppRoot::MODELS_DIR);
+                    let models = asr_core::diarize::fast::FastModelPaths::under(&models_dir);
+                    let cache = asr_core::diarize::fast::build_embedding_cache(
+                        &samples,
+                        &models,
+                        &asr_core::diarize::fast::WindowParams::default(),
+                    )?;
+                    let raw = asr_core::diarize::fast::recluster(&cache, EXPLORE_INITIAL_THRESHOLD as f64);
+                    let merged = asr_core::diarize::merge_same_speaker_runs(&raw, 500, 60_000);
+                    Ok((cache, total_duration_ms, merged))
+                })();
+            result
+        });
+
+        let poll_task = cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let AppScreen::Upload(upload) = &mut this.screen else { return };
+                // A different file may have been picked (and a newer
+                // `start_explore` already kicked off) while this one was
+                // running -- discard a stale result rather than clobbering
+                // the newer explore state.
+                if upload.media_path.as_deref() != Some(expected_media_path.as_path()) {
+                    return;
+                }
+                match result {
+                    Ok((cache, total_duration_ms, merged)) => {
+                        let distinct_speakers = merged.iter().map(|s| s.speaker).collect::<HashSet<_>>().len();
+                        let slider = cx.new(|_cx| {
+                            SliderState::new().min(0.0).max(1.2).step(0.01).default_value(EXPLORE_INITIAL_THRESHOLD)
+                        });
+                        let _slider_subscription =
+                            cx.subscribe(&slider, |this: &mut AppRoot, _slider, event: &SliderEvent, cx| {
+                                if let SliderEvent::Release(value) = event {
+                                    this.recluster_explore(value.end(), cx);
+                                }
+                            });
+                        upload.explore = ExploreState::Ready {
+                            cache: Arc::new(cache),
+                            total_duration_ms,
+                            slider,
+                            _slider_subscription,
+                            preview: merged
+                                .iter()
+                                .map(|s| SegmentBlock { speaker: s.speaker, start_ms: s.start_ms, end_ms: s.end_ms })
+                                .collect(),
+                            distinct_speakers,
+                            generation: Arc::new(AtomicU64::new(0)),
+                            painted_bounds: Rc::new(Cell::new(Bounds::default())),
+                        };
+                    }
+                    Err(err) => {
+                        upload.explore = ExploreState::Failed(format!("{err:#}"));
+                    }
+                }
+                cx.notify();
+            });
+        });
+
+        // Stored (not `.detach()`ed) so `skip_explore` can drop this task to
+        // actually cancel the still-suspended-at-`task.await` future above
+        // (and, transitively, the `spawn_dedicated` computation it's
+        // awaiting) -- see `ExploreState::Building`'s doc comment.
+        let AppScreen::Upload(upload) = &mut self.screen else { return };
+        upload.explore = ExploreState::Building(poll_task);
+        cx.notify();
+    }
+
+    /// "話者数の事前分析をスキップする" checkbox toggle. Turning it **on**
+    /// discards (and, since `ExploreState::Building`'s stored `Task` isn't
+    /// detached, actually cancels) whatever exploration is in flight or
+    /// already done -- `start_pipeline` already treats `Idle` and a
+    /// still-running/failed explore the same way (`DiarizeParams::default()`,
+    /// no hint), so this is a plain reset, not a special case. Turning it
+    /// **off** with a file already picked and no exploration having run yet
+    /// starts one immediately, so flipping the checkbox back doesn't require
+    /// re-picking the file to get the analysis after all.
+    fn set_skip_explore(&mut self, skip: bool, cx: &mut Context<Self>) {
+        let AppScreen::Upload(upload) = &mut self.screen else { return };
+        upload.skip_explore = skip;
+        let should_start = !skip && upload.media_path.is_some() && matches!(upload.explore, ExploreState::Idle);
+        if skip {
+            upload.explore = ExploreState::Idle;
+        }
+        cx.notify();
+        if should_start {
+            self.start_explore(cx);
+        }
+    }
+
+    /// `SliderEvent::Release` handler: re-clusters the cached embeddings at
+    /// the released threshold and updates the preview. Runs on a plain
+    /// `background_executor().spawn` (not `_dedicated` -- `recluster` does
+    /// no ONNX inference, just CPU math, per `asr_core::diarize::fast`'s own
+    /// doc comment) since a real 54-minute-meeting measurement puts this at
+    /// ~250ms -- too slow to run on every drag tick (hence acting only on
+    /// `Release`, not `Change`), but fine as a one-shot background task.
+    fn recluster_explore(&mut self, threshold: f32, cx: &mut Context<Self>) {
+        let AppScreen::Upload(upload) = &mut self.screen else { return };
+        let ExploreState::Ready { cache, generation, .. } = &mut upload.explore else { return };
+        let my_generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let cache = cache.clone();
+
+        let task = cx.background_executor().spawn(async move {
+            let raw = asr_core::diarize::fast::recluster(&cache, threshold as f64);
+            asr_core::diarize::merge_same_speaker_runs(&raw, 500, 60_000)
+        });
+        cx.spawn(async move |this, cx| {
+            let merged = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let AppScreen::Upload(upload) = &mut this.screen else { return };
+                let ExploreState::Ready { generation: current_gen, preview, distinct_speakers, .. } =
+                    &mut upload.explore
+                else {
+                    return;
+                };
+                // Drop a stale result from a slider release that's since
+                // been superseded by a newer one.
+                if current_gen.load(Ordering::SeqCst) != my_generation {
+                    return;
+                }
+                *distinct_speakers = merged.iter().map(|s| s.speaker).collect::<HashSet<_>>().len();
+                *preview =
+                    merged.iter().map(|s| SegmentBlock { speaker: s.speaker, start_ms: s.start_ms, end_ms: s.end_ms }).collect();
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -3099,6 +3429,22 @@ impl AppRoot {
             return; // already running
         }
         let worker_project_id = upload.project_id.clone();
+        // If the explore step (see `start_explore`/`recluster_explore`) has
+        // a usable preview, hand its detected speaker count to the real
+        // diarization run as a hint -- *not* the explore threshold value
+        // itself, which is on an unrelated scale to `cluster_threshold` (see
+        // `ExploreState`'s doc comment) and would risk making the
+        // well-tuned 0.9 default worse rather than better. Falls back to
+        // the untouched default whenever exploration hasn't produced a
+        // result yet (still running, failed, or skipped) -- this is purely
+        // an additive hint, never a precondition for starting the pipeline.
+        let diarize_params = match &upload.explore {
+            ExploreState::Ready { distinct_speakers, .. } if *distinct_speakers > 0 => asr_core::diarize::DiarizeParams {
+                num_speakers: Some(*distinct_speakers as i32),
+                ..Default::default()
+            },
+            _ => asr_core::diarize::DiarizeParams::default(),
+        };
 
         let api_key = match load_api_key() {
             Ok(Some(key)) => key,
@@ -3140,7 +3486,7 @@ impl AppRoot {
                         &worker_media_path,
                         api_key,
                         &models_dir,
-                        &asr_core::diarize::DiarizeParams::default(),
+                        &diarize_params,
                         500,    // max_gap_ms, matches asr-cli's default
                         60_000, // max_merged_ms, matches asr-cli's default
                         300,    // pad_ms, matches asr-cli's default
@@ -3942,6 +4288,57 @@ impl Render for AppRoot {
         let is_running = matches!(upload.status, UploadStatus::Running(_));
         let project_id_for_back = upload.project_id.clone();
 
+        // Fast/exploratory diarization preview (see docs/plan.md's "話者分離
+        // 「探索モード」のUI配線" section) -- sits between picking a file and
+        // starting the real pipeline, purely informational (never blocks
+        // "処理を開始"; see `start_pipeline`'s `diarize_params` derivation).
+        const EXPLORE_PREVIEW_WIDTH: Pixels = px(360.0);
+        let explore_area: AnyElement = match &upload.explore {
+            ExploreState::Idle => div().into_any_element(),
+            ExploreState::Building(_) => div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .w(EXPLORE_PREVIEW_WIDTH)
+                .child(div().text_size(px(13.0)).text_color(rgb(0x9a9ba0)).child("話者数を分析中…"))
+                .child(Progress::new("explore-progress").value(0.0).loading(true))
+                .into_any_element(),
+            ExploreState::Ready { total_duration_ms, slider, preview, distinct_speakers, painted_bounds, .. } => {
+                let pixels_per_second =
+                    f32::from(EXPLORE_PREVIEW_WIDTH) / (*total_duration_ms as f32 / 1000.0).max(1.0);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .w(EXPLORE_PREVIEW_WIDTH)
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(rgb(0x9a9ba0))
+                            .child(format!("検出された話者数: {distinct_speakers}人（推定、スライダーで調整可）")),
+                    )
+                    .child(Slider::new(slider).horizontal())
+                    .child(
+                        div().overflow_hidden().w(EXPLORE_PREVIEW_WIDTH).h(px(28.0)).child(speaker_timeline(
+                            preview.clone(),
+                            *total_duration_ms,
+                            pixels_per_second,
+                            None,
+                            None,
+                            None,
+                            painted_bounds.clone(),
+                        )),
+                    )
+                    .into_any_element()
+            }
+            ExploreState::Failed(message) => div()
+                .w(EXPLORE_PREVIEW_WIDTH)
+                .text_size(px(12.0))
+                .text_color(rgb(0xff8080))
+                .child(format!("話者数の事前分析に失敗しました（処理の開始自体は可能です）: {message}"))
+                .into_any_element(),
+        };
+
         div()
             .size_full()
             .flex()
@@ -4004,6 +4401,21 @@ impl Render for AppRoot {
                         }
                     }),
             )
+            .child(
+                Checkbox::new("skip-explore-checkbox")
+                    .label("話者数の事前分析をスキップする")
+                    .text_size(px(12.0))
+                    .checked(upload.skip_explore)
+                    .on_click({
+                        let weak = weak.clone();
+                        move |checked, _window, cx| {
+                            if let Some(strong) = weak.upgrade() {
+                                strong.update(cx, |this, cx| this.set_skip_explore(*checked, cx));
+                            }
+                        }
+                    }),
+            )
+            .child(explore_area)
             .child(
                 div()
                     .id("start-pipeline")
