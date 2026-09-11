@@ -1,15 +1,20 @@
-//! Editor shell demo: 2-column layout (see `tools/diarization-viewer.html`,
-//! the user's preferred reference) — left: player placeholder; right:
-//! speaker timeline (fixed height) + segment list (flex:1).
+//! The desktop app's main binary (`app`): project list → upload/pipeline →
+//! transcript editor, plus the API-key/settings screen. See docs/plan.md for
+//! the overall design; `AppRoot`/`AppScreen` below is the single window root
+//! that branches its own `render()` between those screens (see `AppRoot`'s
+//! doc comment for why, over `Window::replace_root`).
 //!
-//! Also the first proof of the "focus-swap to a real Textarea" editing
-//! pattern the plan flagged as having no known GPUI precedent: clicking a
-//! row commits whatever was being edited and creates a fresh `TextareaState`
-//! for the clicked row; every other row stays static text.
+//! The editor screen's 2-column layout (left: player; right: speaker
+//! timeline + segment list) follows `tools/diarization-viewer.html` (the
+//! user's preferred reference). Its row-editing pattern -- clicking a row
+//! commits whatever was being edited and creates a fresh `TextareaState` for
+//! the clicked row, every other row stays static text -- was this project's
+//! first proof of a "focus-swap to a real Textarea" approach the plan
+//! flagged as having no known GPUI precedent at the time.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,19 +22,21 @@ use std::time::Duration;
 use asr_audio::{PlaybackRate, Transport};
 use asr_core::pipeline::TranscriptSegment;
 use gpui_kit::base::{Align, ElementExt as _, Placement, Positioner, POPUP_PRIORITY};
-use gpui_kit::component::input::{Input, InputState, Position, RopeExt as _, Textarea, TextareaState};
+use gpui_kit::component::input::{Escape, Input, InputState, Position, RopeExt as _, Textarea, TextareaState};
 use gpui_kit::component::progress::Progress;
+use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::Root;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _, *};
 
 use desktop::segment_list::format_ms;
-use desktop::speaker_timeline::{speaker_color, speaker_timeline, timeline_content_width, timeline_ruler};
+use desktop::speaker_timeline::{speaker_color, speaker_timeline, timeline_content_width, timeline_ruler, SegmentBlock};
 
 /// Applied to both the static row text and the `Textarea` so switching a row
 /// into edit mode doesn't visibly shrink its font — `Textarea`'s own default
 /// (`Size::Medium` -> `.text_sm()`) is smaller than plain `div` text.
 const ROW_TEXT_SIZE: Pixels = px(14.0);
+
 
 // `Cmd`-based keymap (see docs/plan.md's "Cmdベースのキーマップ" section).
 // Structural edits (split/merge) deliberately use `Cmd+Shift+...` rather
@@ -60,6 +67,12 @@ actions!(
         SeekForward,
         RateDown,
         RateUp,
+        SegmentUndo,
+        SegmentRedo,
+        LeaveEdit,
+        SetLoopStart,
+        SetLoopEnd,
+        ToggleLoop,
     ]
 );
 
@@ -102,9 +115,9 @@ fn measure_wrapped_rows(text: &str, font_size: Pixels, wrap_width: Pixels, windo
 }
 
 /// Approximates the text column's rendered width from the window's viewport
-/// size and this file's own layout constants (outer `.p_4()`, the ~42% left
-/// column, `.gap_4()` between columns, the row's `.px_2()`). Not an actual
-/// measured bounds -- see the `measure_wrapped_rows` doc comment.
+/// size and this file's own layout constants (outer `.p_4()`, the fixed
+/// 320px left column, `.gap_4()` between columns, the row's `.px_2()`). Not
+/// an actual measured bounds -- see the `measure_wrapped_rows` doc comment.
 ///
 /// The text sits alone on its own line beneath a time/speaker header line
 /// (see docs/plan.md's row-layout section) -- unlike the old single-row
@@ -113,7 +126,7 @@ fn measure_wrapped_rows(text: &str, font_size: Pixels, wrap_width: Pixels, windo
 fn approximate_text_column_width(window: &Window) -> Pixels {
     let viewport_width = window.viewport_size().width;
     let outer_padding = px(32.0); // .p_4() left + right (1rem = 16px each)
-    let left_column = viewport_width * 0.42;
+    let left_column = px(320.0); // left column's fixed .w(px(320.0))
     let column_gap = px(16.0); // .gap_4() between the two top-level columns
     let right_column_width = viewport_width - outer_padding - left_column - column_gap;
     let row_padding = px(16.0); // row's .px_2() left + right
@@ -122,7 +135,7 @@ fn approximate_text_column_width(window: &Window) -> Pixels {
 
 /// Which step of the (irreversible, see docs/plan.md's speaker-panel
 /// section) speaker-merge flow is currently shown in the panel. `Option`al
-/// on `EditorLayoutDemo` so at most one speaker's flow is open at a time.
+/// on `EditorScreen` so at most one speaker's flow is open at a time.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SpeakerMergeUi {
     /// Picking which speaker `from`'s segments should be merged into.
@@ -132,7 +145,7 @@ enum SpeakerMergeUi {
 }
 
 /// Resolves a speaker's display label: the live text of its name editor
-/// (see `EditorLayoutDemo::speaker_name_states`), falling back to `S{id}`
+/// (see `EditorScreen::speaker_name_states`), falling back to `S{id}`
 /// if it's never been given a custom name or was cleared to blank. A free
 /// function (not a method) because it's also called from inside the
 /// segment list's `render_item` closure, which only has a cloned snapshot
@@ -167,18 +180,18 @@ fn style_speaker_pill<E: Styled>(el: E, color: Hsla) -> E {
 /// What happens when a speaker is picked from a `speaker_option_row` --
 /// factored into an alias per clippy's `type_complexity` (the underlying
 /// type is unwieldy to spell out at every call site).
-type SpeakerPickAction = Rc<dyn Fn(&mut EditorLayoutDemo, i32, &mut Context<EditorLayoutDemo>)>;
+type SpeakerPickAction = Rc<dyn Fn(&mut EditorScreen, i32, &mut Context<EditorScreen>)>;
 
 /// A horizontal row of clickable speaker "pills" (color + label), one per
 /// entry in `speakers` — shared by the per-row reassignment picker (opened
 /// from a segment's speaker badge) and the speaker panel's merge-target
-/// picker. `on_pick` runs against `EditorLayoutDemo` via the usual
+/// picker. `on_pick` runs against `EditorScreen` via the usual
 /// weak-upgrade-and-update dance, parameterized by which speaker was
 /// clicked, so the two call sites can each supply their own action
 /// (`choose_row_speaker` vs `choose_merge_target`) without duplicating the
 /// button-building code.
 fn speaker_option_row(
-    weak: WeakEntity<EditorLayoutDemo>,
+    weak: WeakEntity<EditorScreen>,
     speakers: &[i32],
     speaker_name_states: &HashMap<i32, Entity<TextareaState>>,
     cx: &App,
@@ -205,12 +218,85 @@ fn speaker_option_row(
     row
 }
 
-struct EditorLayoutDemo {
+/// A snapshot of everything `undo`/`redo` restore -- pushed onto
+/// `EditorScreen::undo_stack` before every undoable mutation (see
+/// `push_undo_snapshot`'s call sites). Deliberately whole-state rather than
+/// a per-action inverse (a command pattern): every mutation this app makes
+/// is already a simple, direct state change, so snapshotting is simpler and
+/// more certainly correct than writing and maintaining an inverse for each.
+///
+/// Speaker renames (live-bound `Textarea`, no discrete commit point) and
+/// the speaker visibility toggle (non-destructive, instantly reversible by
+/// toggling again) are deliberately NOT undoable -- see their own call
+/// sites' doc comments.
+///
+/// Body text edits *are* undoable, but only at the granularity of one row's
+/// whole editing session (`commit_focused` pushes a snapshot when a row
+/// loses focus with changed text) -- and only once that focus is actually
+/// released. `Cmd+Z`/`Cmd+Shift+Z` are scoped to `Some("!Input")`, so while
+/// a row's `Textarea` is focused they don't fire at all (`Textarea`'s own
+/// character-level undo/redo does); press `Escape` (`leave_edit`) first to
+/// commit the row and hand focus back, then `Cmd+Z` reaches this stack.
+struct UndoSnapshot {
     segments: Vec<TranscriptSegment>,
+    speaker_names: HashMap<i32, String>,
+    /// Restored alongside `speaker_names` so undoing a speaker merge (which
+    /// removes the merged-away speaker's `speakers.id` mapping) resaves
+    /// under the original id rather than orphaning it.
+    speaker_db_ids: HashMap<i32, String>,
+    /// Restored alongside the above so undoing `add_speaker` removes the
+    /// added speaker from `distinct_speakers` again (the segments themselves
+    /// never change when a speaker is added, so restoring `segments` alone
+    /// wouldn't undo it).
+    extra_speakers: BTreeSet<i32>,
+}
+
+struct EditorScreen {
+    /// `Rc`-wrapped so `render()` can cheaply share it into the `list()`
+    /// element's `'static` render closure (an `Rc::clone` -- just a
+    /// refcount bump) instead of deep-cloning every segment's `text`
+    /// `String` on every render (including every scroll-triggered one --
+    /// see docs/plan.md's "セグメントリストのスクロール性能改善" section
+    /// for the perf investigation that motivated this). Mutations go
+    /// through `Rc::make_mut`, which only actually deep-clones if another
+    /// `Rc` clone is still alive (in practice never, since the previous
+    /// frame's `list()` closure is already dropped by the time a mutation
+    /// runs) -- otherwise it mutates in place, same cost as a plain `Vec`.
+    segments: Rc<Vec<TranscriptSegment>>,
     total_duration_ms: u64,
     list_state: ListState,
     focused_row: Option<usize>,
     editor: Option<Entity<TextareaState>>,
+    /// Fires when `editor`'s own `TextareaState` loses real GPUI window
+    /// focus, for ANY reason -- not just the specific call sites that
+    /// already call `commit_focused` (`focus_row`, `split_focused_segment`,
+    /// `merge_with_previous`, `leave_edit`). Needed because GPUI itself can
+    /// silently steal focus without going through any of our code: the root
+    /// container's `.track_focus(&self.focus_handle)` (see that field's doc
+    /// comment) registers a mousedown listener that refocuses itself the
+    /// instant a click lands anywhere with no more specific focusable
+    /// descendant -- e.g. clicking empty space below the speaker panel.
+    /// Without this subscription that leaves `focused_row`/`editor` stale
+    /// (still `Some`, row still renders as a `Textarea`) even though real
+    /// focus already moved away, and the next `Cmd+Z` skips the
+    /// never-committed edit entirely (it was never pushed onto
+    /// `undo_stack`), undoing one step further back than expected.
+    ///
+    /// Stored (never `.detach()`ed) so `focus_row` assigning a fresh one on
+    /// the next row switch drops and unregisters the previous one
+    /// immediately -- on top of the entity-id guard in the callback itself,
+    /// this means a stale blur notification for an already-replaced editor
+    /// can't double-commit even though blur notifications are delivered
+    /// asynchronously (`Window`'s `DrawPhase::Focus`, after the row switch
+    /// that triggered them has already run to completion).
+    editor_blur_subscription: Option<Subscription>,
+    /// The row `undo`/`redo` last changed, if any -- drawn with a brief
+    /// highlight background so the user can find where an Undo/Redo landed
+    /// (which is otherwise invisible: `restore_snapshot` clears
+    /// `focused_row`, and a long list may put the change off-screen).
+    /// Cleared the moment the user does anything else that would make it
+    /// stale (`focus_row`, `push_undo_snapshot`).
+    highlighted_row: Option<usize>,
     transport: Arc<Transport>,
     /// Tracked on the outer container div (`.track_focus`) so the `Cmd`-based
     /// keymap's `.on_action(...)` handlers have somewhere to dispatch to when
@@ -218,9 +304,10 @@ struct EditorLayoutDemo {
     /// from whatever's currently focused and bubbles *upward* only -- with
     /// nothing ever focused, dispatch falls back to the true window root
     /// (above this entire entity's tree), so keystrokes never reach our
-    /// handlers at all. Explicitly focused on mount and whenever a Textarea
-    /// gives up focus (see `commit_focused`) so the keymap works immediately,
-    /// not just while a row happens to be mid-edit.
+    /// handlers at all. Explicitly focused on mount (via `render`'s
+    /// `window.focused(cx).is_none()` fallback) and whenever `leave_edit`
+    /// (bound to `Escape`) hands focus back, so the keymap works
+    /// immediately, not just while nothing has ever been clicked.
     focus_handle: FocusHandle,
     /// Timeline zoom, in pixels per second of recording (see `zoom_in`/`zoom_out`).
     pixels_per_second: f32,
@@ -262,6 +349,25 @@ struct EditorLayoutDemo {
     /// before), populated with the saved names when reopening a project
     /// from `store::projects::load_project`.
     initial_speaker_names: HashMap<i32, String>,
+    /// Speakers currently toggled off from the timeline and segment list
+    /// (`toggle_speaker_visibility`). Purely a display preference -- not
+    /// undoable (see `UndoSnapshot`'s doc comment) and not persisted.
+    hidden_speakers: BTreeSet<i32>,
+    /// Speakers manually added via `add_speaker` that don't (yet) appear in
+    /// any segment -- `distinct_speakers` is otherwise purely segment-derived
+    /// (see that computation's doc comment in `render`), so a speaker with
+    /// zero segments needs this to keep showing up in the panel/pickers at
+    /// all. Not persisted across a reload: `store::projects::load_project`
+    /// reconstructs speakers from a `segments` JOIN, so a speaker still with
+    /// zero segments here vanishes on reopen (an accepted, narrow gap -- see
+    /// docs/plan.md's "話者の追加機能" section).
+    extra_speakers: BTreeSet<i32>,
+    /// Undo/redo history -- see `UndoSnapshot`'s doc comment for what's
+    /// captured and why whole-state snapshots rather than a command
+    /// pattern. Capped (see `push_undo_snapshot`) so an unbounded editing
+    /// session doesn't grow this without limit.
+    undo_stack: Vec<UndoSnapshot>,
+    redo_stack: Vec<UndoSnapshot>,
     /// The speaker-panel's merge flow, if a step of it is currently open.
     merge_ui: Option<SpeakerMergeUi>,
     /// The segment row whose per-row speaker-reassignment picker (opened by
@@ -283,17 +389,13 @@ struct EditorLayoutDemo {
     /// CLI args) launch path, which deliberately never touches the DB --
     /// autosave below is a no-op whenever they're `None`.
     conn: rusqlite::Connection,
-    // Not read by anything in this feature (`persist` only needs
-    // `media_id`, since `speaker_db_ids`/`segments` already scope
-    // everything else) -- kept because the term panel ((2) in
-    // docs/plan.md, not yet built) is already designed to consume it
-    // directly from here rather than re-deriving it.
-    #[allow(dead_code)]
+    /// `None` for the dev-shortcut launch path -- gates `add_speaker`'s DB
+    /// step, same convention as `speaker_db_ids`'s eager mint/delete calls.
     project_id: Option<String>,
     media_id: Option<String>,
     /// Project-local speaker index -> `speakers.id`, from either
-    /// `store::projects::create_speakers` (freshly created project) or
-    /// `store::projects::load_project` (reopened one).
+    /// `store::projects::create_speakers` (freshly created transcript) or
+    /// `store::projects::load_media` (reopened one).
     speaker_db_ids: HashMap<i32, String>,
     /// Set by every mutating action (segment text/split/merge/speaker
     /// reassignment, and speaker renames via `cx.observe` in `render`);
@@ -301,12 +403,66 @@ struct EditorLayoutDemo {
     /// flag + periodic timer, rather than a save call sprinkled into every
     /// mutator's body -- see docs/plan.md for why.
     dirty: bool,
-    /// Set by the autosave timer if a save attempt fails, so it can be
-    /// surfaced somewhere in the UI instead of failing silently.
+    /// Set by the autosave timer (or `export`) if a save/export attempt
+    /// fails -- rendered as a small error line near the bottom of the
+    /// screen (see `render`).
     save_error: Option<String>,
+    /// The original media file's path -- kept only for `export`'s default
+    /// save-dialog directory/filename (playback itself goes through
+    /// `transport`, which doesn't retain the path once decoded).
+    media_path: PathBuf,
+    /// Whether the "書き出し" format picker is expanded (see `export`).
+    export_picker_open: bool,
+    /// Loop start/end, set independently by `Cmd+Shift+I`/`Cmd+Shift+O`
+    /// (see `set_loop_start`/`set_loop_end`) -- kept separate from
+    /// `transport`'s own active `LoopRegion` since both bounds must be set
+    /// (and `start < end`) before looping can actually be toggled on
+    /// (`toggle_loop`). Not persisted or undoable -- a purely transient
+    /// playback aid, like `hidden_speakers`.
+    loop_start_ms: Option<u64>,
+    loop_end_ms: Option<u64>,
+    /// Whether `transport`'s loop region is currently active. Kept
+    /// alongside `loop_start_ms`/`loop_end_ms` (rather than reading
+    /// `transport.loop_region()` back) so the timeline overlay and the
+    /// toggle's own logic have a single source of truth for "is looping
+    /// on" that doesn't require locking into `transport`.
+    loop_enabled: bool,
 }
 
-impl EditorLayoutDemo {
+/// The 4 formats `EditorScreen::export` can write -- see
+/// `asr_core::export` for the actual conversion functions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    PlainText,
+    Markdown,
+    Srt,
+    Vtt,
+}
+
+impl ExportFormat {
+    const ALL: [ExportFormat; 4] =
+        [ExportFormat::PlainText, ExportFormat::Markdown, ExportFormat::Srt, ExportFormat::Vtt];
+
+    fn label(self) -> &'static str {
+        match self {
+            ExportFormat::PlainText => "プレーンテキスト",
+            ExportFormat::Markdown => "Markdown",
+            ExportFormat::Srt => "SRT",
+            ExportFormat::Vtt => "VTT",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            ExportFormat::PlainText => "txt",
+            ExportFormat::Markdown => "md",
+            ExportFormat::Srt => "srt",
+            ExportFormat::Vtt => "vtt",
+        }
+    }
+}
+
+impl EditorScreen {
     /// Fixed jump size for `Cmd+Option+←/→` (see `seek_back`/`seek_forward`).
     const SEEK_STEP_MS: u64 = 5_000;
 
@@ -337,7 +493,27 @@ impl EditorLayoutDemo {
             s
         });
         self.focused_row = Some(ix);
-        self.editor = Some(state);
+        self.editor = Some(state.clone());
+        // See `editor_blur_subscription`'s doc comment: this is what
+        // reconciles `focused_row`/`editor` when GPUI moves real focus away
+        // from this Textarea for a reason our own code never sees (most
+        // notably the root container's own automatic focus-steal on
+        // mousedown). Assigning here drops+unregisters whatever the
+        // previous row's subscription was, so a stale notification for an
+        // already-replaced editor can't fire at all -- the entity-id check
+        // inside the callback is a second, independent guard on top of
+        // that.
+        let entity_id = state.entity_id();
+        let focus_handle = state.read(cx).focus_handle(cx);
+        self.editor_blur_subscription = Some(cx.on_blur(&focus_handle, window, move |this, _window, cx| {
+            if this.editor.as_ref().map(Entity::entity_id) == Some(entity_id) {
+                this.commit_focused(cx);
+                cx.notify();
+            }
+        }));
+        // Whatever `undo`/`redo` last pointed at is stale the moment the
+        // user actively picks a row themselves.
+        self.highlighted_row = None;
         // Keyboard navigation (Cmd+↓/↑) and split/merge can focus a row
         // that's scrolled out of view; bring it fully into view. A single
         // choke point here covers every way a row can become focused
@@ -353,9 +529,42 @@ impl EditorLayoutDemo {
     fn commit_focused(&mut self, cx: &mut Context<Self>) {
         if let (Some(ix), Some(editor)) = (self.focused_row.take(), self.editor.take()) {
             let text = editor.read(cx).text().to_string();
-            self.segments[ix].text = text;
-            self.dirty = true;
+            // Only snapshot/mark dirty if the text actually changed --
+            // `commit_focused` runs on *every* row switch (see `focus_row`),
+            // including ones where nothing was edited; pushing a snapshot
+            // unconditionally would flood the undo stack with no-op entries
+            // every time the user just clicks through rows.
+            if text != self.segments[ix].text {
+                self.push_undo_snapshot(cx);
+                Rc::make_mut(&mut self.segments)[ix].text = text;
+                self.dirty = true;
+            }
         }
+    }
+
+    /// `Escape` -- leaves edit mode (committing whatever was focused, same
+    /// as switching rows) and hands focus back to `focus_handle`. This is
+    /// the *only* way out of a focused `Textarea` today (see this method's
+    /// call sites in `main`'s keymap wiring for why that matters): without
+    /// it, once any row (or a speaker-name field) is clicked, the "Input"
+    /// key context never goes away, and the `Some("!Input")`-scoped
+    /// `Cmd+Z`/`Cmd+Shift+Z` bindings can never fire again for the rest of
+    /// the session.
+    ///
+    /// If a picker is open, closes that first instead (innermost thing
+    /// cancels first, matching ordinary Escape conventions) -- pickers
+    /// don't hold GPUI focus themselves, so leaving them open while also
+    /// blurring the input would be a confusing half-step.
+    fn leave_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.row_speaker_picker_open_for.is_some() || self.merge_ui.is_some() {
+            self.row_speaker_picker_open_for = None;
+            self.merge_ui = None;
+            cx.notify();
+            return;
+        }
+        self.commit_focused(cx); // no-op if nothing is focused
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
     }
 
     /// `Cmd+↓` — commit and focus the next segment. A no-op past the last
@@ -407,9 +616,11 @@ impl EditorLayoutDemo {
         second.start_ms = split_ms;
         second.text = after.trim_start().to_string();
 
-        self.segments[ix].end_ms = split_ms;
-        self.segments[ix].text = before.trim_end().to_string();
-        self.segments.insert(ix + 1, second);
+        self.push_undo_snapshot(cx);
+        let segments = Rc::make_mut(&mut self.segments);
+        segments[ix].end_ms = split_ms;
+        segments[ix].text = before.trim_end().to_string();
+        segments.insert(ix + 1, second);
         self.dirty = true;
 
         self.list_state = ListState::new(self.segments.len(), ListAlignment::Top, px(400.0));
@@ -442,8 +653,10 @@ impl EditorLayoutDemo {
         }
         self.commit_focused(cx);
 
-        let current = self.segments.remove(ix);
-        let prev = &mut self.segments[ix - 1];
+        self.push_undo_snapshot(cx);
+        let segments = Rc::make_mut(&mut self.segments);
+        let current = segments.remove(ix);
+        let prev = &mut segments[ix - 1];
         prev.end_ms = current.end_ms;
         prev.text = format!("{}{}", prev.text, current.text);
         self.dirty = true;
@@ -456,7 +669,8 @@ impl EditorLayoutDemo {
     /// (so `Cmd+1` is speaker 0, matching the existing "S0", "S1", ... labels).
     fn assign_speaker(&mut self, speaker: i32, cx: &mut Context<Self>) {
         if let Some(ix) = self.focused_row {
-            self.segments[ix].speaker = speaker;
+            self.push_undo_snapshot(cx);
+            Rc::make_mut(&mut self.segments)[ix].speaker = speaker;
             self.dirty = true;
             cx.notify();
         }
@@ -498,6 +712,58 @@ impl EditorLayoutDemo {
         if let Some(rate) = PlaybackRate::new((self.transport.rate() + 0.25).min(PlaybackRate::MAX)) {
             self.transport.set_rate(rate);
             cx.notify();
+        }
+    }
+
+    /// `Cmd+Shift+I` — sets the loop's start to the current (latency-
+    /// corrected) playhead. If looping is already on, the active region is
+    /// refreshed immediately rather than requiring a separate toggle.
+    fn set_loop_start(&mut self, cx: &mut Context<Self>) {
+        self.loop_start_ms = Some(self.transport.position_ms());
+        self.refresh_loop_region();
+        cx.notify();
+    }
+
+    /// `Cmd+Shift+O` — see `set_loop_start`.
+    fn set_loop_end(&mut self, cx: &mut Context<Self>) {
+        self.loop_end_ms = Some(self.transport.position_ms());
+        self.refresh_loop_region();
+        cx.notify();
+    }
+
+    /// `Cmd+Shift+L` — toggles looping on/off. Turning it on is a no-op
+    /// unless both bounds are set and `start < end` (see the plan's doc:
+    /// "開始・終了の両方が設定済みの場合のみ有効").
+    fn toggle_loop(&mut self, cx: &mut Context<Self>) {
+        if self.loop_enabled {
+            self.loop_enabled = false;
+            self.transport.set_loop_region(None);
+        } else if let (Some(start), Some(end)) = (self.loop_start_ms, self.loop_end_ms) {
+            if start < end {
+                self.loop_enabled = true;
+                self.transport.set_loop_region(Some(asr_audio::LoopRegion { start_ms: start, end_ms: end }));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Re-applies `transport`'s active loop region from the current
+    /// `loop_start_ms`/`loop_end_ms` whenever looping is already on (called
+    /// after either bound changes) -- if the bounds have become invalid
+    /// (missing, or `start >= end`) this turns looping back off instead of
+    /// leaving a stale region active.
+    fn refresh_loop_region(&mut self) {
+        if !self.loop_enabled {
+            return;
+        }
+        match (self.loop_start_ms, self.loop_end_ms) {
+            (Some(start), Some(end)) if start < end => {
+                self.transport.set_loop_region(Some(asr_audio::LoopRegion { start_ms: start, end_ms: end }));
+            }
+            _ => {
+                self.loop_enabled = false;
+                self.transport.set_loop_region(None);
+            }
         }
     }
 
@@ -602,7 +868,8 @@ impl EditorLayoutDemo {
     }
 
     fn choose_row_speaker(&mut self, ix: usize, speaker: i32, cx: &mut Context<Self>) {
-        self.segments[ix].speaker = speaker;
+        self.push_undo_snapshot(cx);
+        Rc::make_mut(&mut self.segments)[ix].speaker = speaker;
         self.row_speaker_picker_open_for = None;
         self.dirty = true;
         cx.notify();
@@ -611,6 +878,16 @@ impl EditorLayoutDemo {
     /// Clicking outside the floating picker -- dismiss without picking.
     fn close_row_speaker_picker(&mut self, cx: &mut Context<Self>) {
         self.row_speaker_picker_open_for = None;
+        cx.notify();
+    }
+
+    /// Speaker panel's visibility toggle -- hides/shows this speaker's
+    /// timeline blocks and segment rows. Purely a display preference, not
+    /// pushed onto the undo stack (see `hidden_speakers`'s doc comment).
+    fn toggle_speaker_visibility(&mut self, speaker: i32, cx: &mut Context<Self>) {
+        if !self.hidden_speakers.remove(&speaker) {
+            self.hidden_speakers.insert(speaker);
+        }
         cx.notify();
     }
 
@@ -642,7 +919,8 @@ impl EditorLayoutDemo {
     /// picked — agreed with the user given how easy an accidental click
     /// would otherwise be to make irreversibly.
     fn confirm_merge(&mut self, from: i32, into: i32, cx: &mut Context<Self>) {
-        for seg in &mut self.segments {
+        self.push_undo_snapshot(cx);
+        for seg in Rc::make_mut(&mut self.segments) {
             if seg.speaker == from {
                 seg.speaker = into;
             }
@@ -663,10 +941,246 @@ impl EditorLayoutDemo {
         cx.notify();
     }
 
+    /// Adds a brand-new speaker with zero segments -- the fix for a
+    /// diarization mistake where two people who should have been separated
+    /// were left merged into one speaker. The new speaker shows up
+    /// immediately in the panel and every picker (`distinct_speakers` is
+    /// widened via `extra_speakers`, see that field's doc comment); the user
+    /// then reassigns individual segments to it via the existing per-row
+    /// picker or `Cmd+1`..`9`.
+    ///
+    /// Mints the `speakers` DB row eagerly/synchronously, matching
+    /// `confirm_merge`'s convention for structural speaker-set changes
+    /// (names/segments instead sync lazily via the autosave timer). No-ops
+    /// the DB step for the dev-shortcut launch path (`project_id.is_none()`),
+    /// same as everywhere else that touches `speaker_db_ids`.
+    fn add_speaker(&mut self, cx: &mut Context<Self>) {
+        self.push_undo_snapshot(cx);
+        let next_index = self
+            .segments
+            .iter()
+            .map(|s| s.speaker)
+            .chain(self.extra_speakers.iter().copied())
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        if self.project_id.is_some() {
+            match asr_core::store::projects::create_speaker(&self.conn, &format!("S{next_index}")) {
+                Ok(speaker_id) => {
+                    self.speaker_db_ids.insert(next_index, speaker_id);
+                }
+                Err(err) => {
+                    self.save_error = Some(format!("話者の追加に失敗しました: {err:#}"));
+                    // Undo the snapshot we just pushed -- nothing actually
+                    // changed, so don't leave a no-op undo step behind.
+                    self.undo_stack.pop();
+                    return;
+                }
+            }
+        }
+        // Name intentionally left unset: `render()`'s existing lazy-creation
+        // fallback (`format!("S{speaker}")`) picks the same default, so this
+        // speaker gets exactly the same naming convention as any other.
+        self.extra_speakers.insert(next_index);
+        self.dirty = true;
+        cx.notify();
+    }
+
+    /// Deletes segment `ix` outright -- no confirmation step (unlike the
+    /// speaker-merge flow), since `undo` is now the safety net instead.
+    fn delete_segment(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix >= self.segments.len() {
+            return;
+        }
+        self.push_undo_snapshot(cx);
+        Rc::make_mut(&mut self.segments).remove(ix);
+        self.dirty = true;
+        if self.focused_row == Some(ix) {
+            self.focused_row = None;
+            self.editor = None;
+        } else if let Some(f) = self.focused_row {
+            if f > ix {
+                self.focused_row = Some(f - 1);
+            }
+        }
+        self.list_state = ListState::new(self.segments.len(), ListAlignment::Top, px(400.0));
+        cx.notify();
+    }
+
+    /// Toggles the "書き出し" format picker (a plain inline expand/collapse
+    /// flag, not a floating positioner -- unlike the per-row speaker picker,
+    /// this button always has the same, fixed screen position, so there's
+    /// nothing to position relative to).
+    fn toggle_export_picker(&mut self, cx: &mut Context<Self>) {
+        self.export_picker_open = !self.export_picker_open;
+        cx.notify();
+    }
+
+    /// Writes the current transcript to a user-chosen file in `format`.
+    /// Resolves each segment's speaker name the same way the segment list
+    /// itself does (`speaker_label`, falling back to `S{index}`), asks
+    /// for a save location via the native save dialog (defaulting to the
+    /// original media file's own directory/filename), and writes the
+    /// result with `std::fs::write`. Failures (including a cancelled
+    /// dialog resolving to `None`, which is simply a no-op) are recorded in
+    /// `save_error` for `render` to show.
+    fn export(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
+        self.export_picker_open = false;
+        let distinct_speakers: BTreeSet<i32> = self.segments.iter().map(|s| s.speaker).collect();
+        let speaker_names: HashMap<i32, String> = distinct_speakers
+            .into_iter()
+            .map(|speaker| (speaker, speaker_label(speaker, &self.speaker_name_states, cx)))
+            .collect();
+        let segments = self.segments.clone();
+        let content = match format {
+            ExportFormat::PlainText => asr_core::export::to_plain_text(&segments, &speaker_names),
+            ExportFormat::Markdown => asr_core::export::to_markdown(&segments, &speaker_names),
+            ExportFormat::Srt => asr_core::export::to_srt(&segments, &speaker_names),
+            ExportFormat::Vtt => asr_core::export::to_vtt(&segments, &speaker_names),
+        };
+
+        let default_dir = self.media_path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let stem = self.media_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "transcript".to_string());
+        let suggested_name = format!("{stem}.{}", format.extension());
+
+        let rx = cx.prompt_for_new_path(&default_dir, Some(&suggested_name));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = rx.await else { return }; // cancelled or platform error -- no-op
+            let result = std::fs::write(&path, content);
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.save_error = None,
+                    Err(err) => this.save_error = Some(format!("書き出しに失敗しました: {err:#}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Reads the current, live state into a snapshot -- used both to push
+    /// onto `undo_stack`/`redo_stack` before a mutation, and to capture
+    /// "where we are now" onto the opposite stack when `undo`/`redo` fires.
+    fn capture_snapshot(&self, cx: &App) -> UndoSnapshot {
+        let speaker_names =
+            self.speaker_name_states.iter().map(|(&s, state)| (s, state.read(cx).text().to_string())).collect();
+        UndoSnapshot {
+            // `UndoSnapshot.segments` stays a plain `Vec` (not `Rc`) --
+            // undo/redo only happens on discrete user actions, not every
+            // scroll frame, so this deep clone's O(n) cost is a non-issue
+            // (matches the existing "snapshot-based undo, simplicity over
+            // perf" design already used here).
+            segments: (*self.segments).clone(),
+            speaker_names,
+            speaker_db_ids: self.speaker_db_ids.clone(),
+            extra_speakers: self.extra_speakers.clone(),
+        }
+    }
+
+    /// Called at the top of every undoable mutation (see `UndoSnapshot`'s
+    /// doc comment for exactly which ones). Starting a new undoable action
+    /// discards the redo history, matching standard undo/redo semantics --
+    /// once you've made a fresh change, "redo" no longer means anything.
+    fn push_undo_snapshot(&mut self, cx: &App) {
+        const MAX_UNDO_DEPTH: usize = 100;
+        self.undo_stack.push(self.capture_snapshot(cx));
+        if self.undo_stack.len() > MAX_UNDO_DEPTH {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+        // A fresh change makes wherever the last undo/redo landed stale.
+        self.highlighted_row = None;
+    }
+
+    /// `Cmd+Z` (outside any Textarea -- see `main`'s `"!Input"`-scoped
+    /// keybinding for why).
+    fn undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.undo_stack.pop() else { return };
+        let current = self.capture_snapshot(cx);
+        self.redo_stack.push(current);
+        self.restore_snapshot(snapshot, window, cx);
+    }
+
+    /// `Cmd+Shift+Z` (outside any Textarea).
+    fn redo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.redo_stack.pop() else { return };
+        let current = self.capture_snapshot(cx);
+        self.undo_stack.push(current);
+        self.restore_snapshot(snapshot, window, cx);
+    }
+
+    fn restore_snapshot(&mut self, snapshot: UndoSnapshot, window: &mut Window, cx: &mut Context<Self>) {
+        // Taken before `self.segments` is overwritten below -- tells the
+        // user where this undo/redo actually landed (see `highlighted_row`'s
+        // doc comment; otherwise there's no visible sign anything happened
+        // for a change outside the current viewport).
+        let changed_row = Self::first_difference(&self.segments, &snapshot.segments);
+
+        self.segments = Rc::new(snapshot.segments);
+        self.speaker_db_ids = snapshot.speaker_db_ids;
+        self.extra_speakers = snapshot.extra_speakers;
+        // Speakers with a live `Textarea` already get their name written
+        // back directly; a speaker with no entity yet (e.g. one a merge
+        // undo just brought back) is seeded into `initial_speaker_names`
+        // instead, so `render()`'s existing lazy-creation logic (see that
+        // field's doc comment) picks up the right name the moment it
+        // reappears in `distinct_speakers`.
+        for (speaker, name) in &snapshot.speaker_names {
+            if let Some(state) = self.speaker_name_states.get(speaker) {
+                state.update(cx, |s, cx| s.set_value(name.clone(), window, cx));
+            } else {
+                self.initial_speaker_names.insert(*speaker, name.clone());
+            }
+        }
+        self.focused_row = None;
+        self.editor = None;
+        self.list_state = ListState::new(self.segments.len(), ListAlignment::Top, px(400.0));
+        self.highlighted_row = changed_row;
+        if let Some(ix) = changed_row {
+            self.list_state.scroll_to_reveal_item(ix);
+        }
+        // Drop any name editor for a speaker that's no longer reachable at
+        // all after this restore (segments-derived ∪ `extra_speakers`) --
+        // mirrors `confirm_merge`'s explicit `remove` for the same reason
+        // (otherwise e.g. undoing `add_speaker` leaks that speaker's
+        // `TextareaState` entity forever, even though it no longer shows up
+        // anywhere).
+        let still_live: BTreeSet<i32> =
+            self.segments.iter().map(|s| s.speaker).chain(self.extra_speakers.iter().copied()).collect();
+        self.speaker_name_states.retain(|speaker, _| still_live.contains(speaker));
+        self.dirty = true;
+        cx.notify();
+    }
+
+    /// The first index at which `before`/`after` disagree -- used by
+    /// `restore_snapshot` to find "what changed" for the highlight, since an
+    /// undo/redo only carries the two full segment lists, not a diff.
+    /// Returns `None` for a no-op restore (e.g. undoing a speaker rename,
+    /// which doesn't touch `segments` at all) or when `after` is empty.
+    /// A length mismatch (insert/delete) still resolves to a single index:
+    /// the split point itself is the change.
+    fn first_difference(before: &[TranscriptSegment], after: &[TranscriptSegment]) -> Option<usize> {
+        if after.is_empty() {
+            return None;
+        }
+        let common = before.len().min(after.len());
+        for ix in 0..common {
+            if before[ix] != after[ix] {
+                return Some(ix);
+            }
+        }
+        if before.len() == after.len() {
+            None
+        } else {
+            Some(common.min(after.len() - 1))
+        }
+    }
+
     /// Writes the current `segments` + speaker names back to the DB. Called
-    /// only by the autosave timer in `build_editor_entity` (see its doc
-    /// comment for why a periodic pass is used instead of a save call in
-    /// every mutator). No-ops for the dev-shortcut launch path
+    /// only by the autosave timer in `build_editor_entity`
+    /// (see its doc comment for why a periodic pass is used instead of a
+    /// save call in every mutator). No-ops for the dev-shortcut launch path
     /// (`media_id.is_none()`). Only clears `dirty` on a fully successful
     /// save -- a failed attempt leaves it set so the next tick retries
     /// automatically, and records the error in `save_error` for the UI to
@@ -694,7 +1208,7 @@ impl EditorLayoutDemo {
     }
 }
 
-impl Render for EditorLayoutDemo {
+impl Render for EditorScreen {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Whenever nothing holds focus (initial mount, or a Textarea just
         // gave it up -- e.g. `commit_focused`), claim it for our own
@@ -736,11 +1250,28 @@ impl Render for EditorLayoutDemo {
             }
         }
 
+        // Built in the same single pass as `distinct_speakers` below (rather
+        // than the panel loop calling `self.segments.iter().filter(...).count()`
+        // once per speaker, which turns an O(n) scan into an effective
+        // O(n × distinct_speakers) one -- see docs/plan.md's "セグメント
+        // リストのスクロール性能改善" section for the investigation that
+        // found this scaling badly at a few thousand segments).
+        let mut speaker_counts: HashMap<i32, usize> = HashMap::new();
+        for seg in self.segments.iter() {
+            *speaker_counts.entry(seg.speaker).or_insert(0) += 1;
+        }
+
         // Ensure every speaker appearing in `segments` has a name editor
         // (see `speaker_name_states`'s doc comment). Runs every render, but
         // is a no-op past the first time each speaker is seen.
         let distinct_speakers: Vec<i32> = {
-            let set: BTreeSet<i32> = self.segments.iter().map(|s| s.speaker).collect();
+            let mut set: BTreeSet<i32> = speaker_counts.keys().copied().collect();
+            // Manually-added speakers with no segments yet (`add_speaker`)
+            // don't otherwise appear here at all -- see `extra_speakers`'s
+            // doc comment. Widening this one set widens every downstream
+            // consumer (the lazy-creation loop right below, the panel, and
+            // every picker) simultaneously.
+            set.extend(&self.extra_speakers);
             for &speaker in &set {
                 if self.speaker_name_states.contains_key(&speaker) {
                     continue;
@@ -761,7 +1292,7 @@ impl Render for EditorLayoutDemo {
                 // Textarea is always live-bound, see `speaker_label`) --
                 // observe it so a rename still flips `dirty` for the
                 // autosave timer to pick up.
-                cx.observe(&state, |this: &mut EditorLayoutDemo, _state, cx| {
+                cx.observe(&state, |this: &mut EditorScreen, _state, cx| {
                     this.dirty = true;
                     cx.notify();
                 })
@@ -770,15 +1301,26 @@ impl Render for EditorLayoutDemo {
             }
             set.into_iter().collect()
         };
+
         let row_speaker_picker_open_for = self.row_speaker_picker_open_for;
         let speaker_name_states_for_list = self.speaker_name_states.clone();
         let distinct_speakers_for_list = distinct_speakers.clone();
         let badge_bounds = self.badge_bounds.clone();
+        let hidden_speakers_for_list = self.hidden_speakers.clone();
+        let highlighted_row = self.highlighted_row;
 
         let list = list(
             self.list_state.clone(),
             move |ix: usize, _window, cx| -> AnyElement {
                 let seg = &segments[ix];
+                // Hidden speaker -- collapse to nothing (zero height, no
+                // gap) rather than skip the index: `focused_row`/
+                // `row_speaker_picker_open_for`/`badge_bounds` etc. all
+                // still address `self.segments`'s real indices, so the row
+                // "exists", it's just not drawn.
+                if hidden_speakers_for_list.contains(&seg.speaker) {
+                    return div().into_any_element();
+                }
                 let label = speaker_label(seg.speaker, &speaker_name_states_for_list, cx);
                 // Header line: time, then speaker badge (in that order --
                 // requested so the badge, whose width now varies with a
@@ -788,42 +1330,72 @@ impl Render for EditorLayoutDemo {
                 let header = div()
                     .flex()
                     .items_center()
+                    .justify_between()
                     .gap_2()
                     .child(
                         div()
-                            .id(("segment-timestamp", ix))
-                            .flex_none()
-                            .text_size(px(12.0))
-                            .line_height(Rems(1.0))
-                            .text_color(rgb(0x888888))
-                            .cursor_pointer()
-                            .child(format_ms(seg.start_ms))
-                            .on_click({
-                                let weak = weak.clone();
-                                let start_ms = seg.start_ms;
-                                move |_event, _window, cx| {
-                                    // Don't also trigger the row's own
-                                    // on_click (focus_row) below.
-                                    cx.stop_propagation();
-                                    if let Some(strong) = weak.upgrade() {
-                                        strong.update(cx, |this, cx| {
-                                            this.transport.seek(start_ms);
-                                            cx.notify();
-                                        });
-                                    }
-                                }
-                            }),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id(("segment-timestamp", ix))
+                                    .flex_none()
+                                    .text_size(px(12.0))
+                                    .line_height(Rems(1.0))
+                                    .text_color(rgb(0x888888))
+                                    .cursor_pointer()
+                                    .child(format_ms(seg.start_ms))
+                                    .on_click({
+                                        let weak = weak.clone();
+                                        let start_ms = seg.start_ms;
+                                        move |_event, _window, cx| {
+                                            // Don't also trigger the row's own
+                                            // on_click (focus_row) below.
+                                            cx.stop_propagation();
+                                            if let Some(strong) = weak.upgrade() {
+                                                strong.update(cx, |this, cx| {
+                                                    this.transport.seek(start_ms);
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }
+                                    }),
+                            )
+                            .child(
+                                style_speaker_pill(div().id(("speaker-badge", ix)), speaker_color(seg.speaker))
+                                    .cursor_pointer()
+                                    .child(label)
+                                    .on_prepaint({
+                                        let badge_bounds = badge_bounds.clone();
+                                        move |bounds, _window, _cx| {
+                                            badge_bounds.borrow_mut().insert(ix, bounds);
+                                        }
+                                    })
+                                    .on_click({
+                                        let weak = weak.clone();
+                                        move |_event, _window, cx| {
+                                            // Don't also trigger the row's own
+                                            // on_click (focus_row) below.
+                                            cx.stop_propagation();
+                                            if let Some(strong) = weak.upgrade() {
+                                                strong.update(cx, |this, cx| this.toggle_row_speaker_picker(ix, cx));
+                                            }
+                                        }
+                                    }),
+                            ),
                     )
                     .child(
-                        style_speaker_pill(div().id(("speaker-badge", ix)), speaker_color(seg.speaker))
+                        // Instant delete -- no confirmation (deliberate
+                        // choice, safety net is Cmd+Z/Cmd+Shift+Z undo).
+                        div()
+                            .id(("segment-delete", ix))
+                            .flex_none()
+                            .px_1()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x9a9ba0))
                             .cursor_pointer()
-                            .child(label)
-                            .on_prepaint({
-                                let badge_bounds = badge_bounds.clone();
-                                move |bounds, _window, _cx| {
-                                    badge_bounds.borrow_mut().insert(ix, bounds);
-                                }
-                            })
+                            .child("削除")
                             .on_click({
                                 let weak = weak.clone();
                                 move |_event, _window, cx| {
@@ -831,7 +1403,7 @@ impl Render for EditorLayoutDemo {
                                     // on_click (focus_row) below.
                                     cx.stop_propagation();
                                     if let Some(strong) = weak.upgrade() {
-                                        strong.update(cx, |this, cx| this.toggle_row_speaker_picker(ix, cx));
+                                        strong.update(cx, |this, cx| this.delete_segment(ix, cx));
                                     }
                                 }
                             }),
@@ -853,6 +1425,45 @@ impl Render for EditorLayoutDemo {
                 if current_ix == Some(ix) {
                     row = row.bg(rgba(0x5b9cf62e));
                 }
+                // Where the last `undo`/`redo` landed (see `highlighted_row`'s
+                // doc comment) -- a different, warmer wash than the
+                // currently-playing row above so the two don't read as the
+                // same thing; background only, no border, since the row
+                // already has a `border_b_1` whose color this shouldn't
+                // touch.
+                if highlighted_row == Some(ix) {
+                    row = row.bg(rgba(0xf5a62333));
+                }
+                // Currently-editing row: an inset ring, not a regular
+                // border -- `.border_1()` is part of Taffy's box model and
+                // would shift the row's measured height/width (however
+                // slightly) the moment editing starts; an *inset* box-shadow
+                // is a pure paint effect (`gpui-pre-0.3.4/src/window.rs`'s
+                // `paint_inset_shadows` dilates the bounds by `-spread`
+                // rather than touching layout) and, being inset rather than
+                // a normal outward shadow, can't bleed into a neighboring
+                // row's slot in this virtualized list. Same accent blue as
+                // the playhead wash above, but opaque -- this is the row's
+                // *own* focus indicator, not a wash. Needed because
+                // `appearance(false)` on the `Textarea` below (for the
+                // static/editing size match) also disables
+                // `gpui-component`'s own built-in focus ring.
+                if focused_row == Some(ix) {
+                    const RING_COLOR: u32 = 0x5b9cf6;
+                    // The row already carries a `border_b_1` (the between-
+                    // row divider) at the same 1px band the inset shadow's
+                    // bottom edge occupies -- and `Style::paint` draws the
+                    // border LAST (background -> inset shadow -> children ->
+                    // border, `gpui-pre-0.3.4/src/style.rs:711-757`), so the
+                    // divider's dark color was silently painting over the
+                    // ring's bottom edge every time. Recoloring that same
+                    // border (not widening it -- it's already 1px on every
+                    // row) folds it into the ring instead of hiding it.
+                    row = row.border_color(rgb(RING_COLOR));
+                    row = row.shadow(vec![
+                        BoxShadow::new(px(0.0), px(0.0), rgb(RING_COLOR).into()).spread_radius(px(1.0)).inset(),
+                    ]);
+                }
 
                 let row_el: AnyElement = if focused_row == Some(ix) {
                     let state = editor.clone().expect("editor is Some whenever focused_row is Some");
@@ -861,7 +1472,37 @@ impl Render for EditorLayoutDemo {
                     // 1px border added a small mismatch against the static
                     // row's borderless text that padding/line-height
                     // matching alone couldn't close.
-                    row.child(Textarea::new(&state).w_full().text_size(ROW_TEXT_SIZE).appearance(false)).into_any_element()
+                    //
+                    // KNOWN ISSUE (not fixable from here): on some wrapped
+                    // lines, the character at the wrap boundary renders cut
+                    // in half. Root-caused as far as a standalone, isolated
+                    // repro (a separate minimal crate, outside this app
+                    // entirely) could take it: the wrap decision's own
+                    // shaped output can be measurably WIDER than the
+                    // `wrap_width` it was computed against (up to 15-35px
+                    // over, confirmed via a patched local `gpui-base`
+                    // build), and it's specifically tied to certain
+                    // punctuation (`、` reliably reproduced it in isolation;
+                    // `。`/`・`/half- and full-width spaces/a single Latin
+                    // `,` did not, in every case tried) -- but not every
+                    // text containing `、` reproduces it either, so the
+                    // exact trigger wasn't fully pinned down. This is inside
+                    // `gpui-base` 0.6.0's own wrapped-line logic, a
+                    // version-pinned upstream dependency -- not something to
+                    // patch from `apps/desktop`. See docs/plan.md for the
+                    // full investigation trail.
+                    //
+                    // Tried and reverted: reserving empty side margin
+                    // (`.px(...)`) for the overshoot to land in, hoping to
+                    // keep it off the row's real edge. Made a real case
+                    // worse instead of better -- narrowing the Textarea's
+                    // own available width shifts the wrap boundary to a
+                    // *different* character, whose own overshoot isn't
+                    // predictably smaller (the overshoot size is tied to
+                    // content, not to wrap_width), so this is not a safe
+                    // mitigation. No margin is applied here.
+                    row.child(Textarea::new(&state).w_full().min_w(px(0.0)).text_size(ROW_TEXT_SIZE).appearance(false))
+                        .into_any_element()
                 } else {
                     let weak = weak.clone();
                     row.id(("segment-row", ix))
@@ -1070,7 +1711,7 @@ impl Render for EditorLayoutDemo {
                 let weak = root_weak.clone();
                 move |_: &SeekBack, _window, cx| {
                     if let Some(strong) = weak.upgrade() {
-                        strong.update(cx, |this, cx| this.seek_back(EditorLayoutDemo::SEEK_STEP_MS, cx));
+                        strong.update(cx, |this, cx| this.seek_back(EditorScreen::SEEK_STEP_MS, cx));
                     }
                 }
             })
@@ -1078,7 +1719,7 @@ impl Render for EditorLayoutDemo {
                 let weak = root_weak.clone();
                 move |_: &SeekForward, _window, cx| {
                     if let Some(strong) = weak.upgrade() {
-                        strong.update(cx, |this, cx| this.seek_forward(EditorLayoutDemo::SEEK_STEP_MS, cx));
+                        strong.update(cx, |this, cx| this.seek_forward(EditorScreen::SEEK_STEP_MS, cx));
                     }
                 }
             })
@@ -1095,6 +1736,72 @@ impl Render for EditorLayoutDemo {
                 move |_: &RateUp, _window, cx| {
                     if let Some(strong) = weak.upgrade() {
                         strong.update(cx, |this, cx| this.rate_up(cx));
+                    }
+                }
+            })
+            .on_action({
+                let weak = root_weak.clone();
+                move |_: &SetLoopStart, _window, cx| {
+                    if let Some(strong) = weak.upgrade() {
+                        strong.update(cx, |this, cx| this.set_loop_start(cx));
+                    }
+                }
+            })
+            .on_action({
+                let weak = root_weak.clone();
+                move |_: &SetLoopEnd, _window, cx| {
+                    if let Some(strong) = weak.upgrade() {
+                        strong.update(cx, |this, cx| this.set_loop_end(cx));
+                    }
+                }
+            })
+            .on_action({
+                let weak = root_weak.clone();
+                move |_: &ToggleLoop, _window, cx| {
+                    if let Some(strong) = weak.upgrade() {
+                        strong.update(cx, |this, cx| this.toggle_loop(cx));
+                    }
+                }
+            })
+            .on_action({
+                let weak = root_weak.clone();
+                move |_: &SegmentUndo, window, cx| {
+                    if let Some(strong) = weak.upgrade() {
+                        strong.update(cx, |this, cx| this.undo(window, cx));
+                    }
+                }
+            })
+            .on_action({
+                let weak = root_weak.clone();
+                move |_: &SegmentRedo, window, cx| {
+                    if let Some(strong) = weak.upgrade() {
+                        strong.update(cx, |this, cx| this.redo(window, cx));
+                    }
+                }
+            })
+            // Fires while a Textarea/Input *is* focused: `gpui-base`'s own
+            // `Escape` handler (`Some("Input")`-scoped) propagates once it's
+            // done with its own concerns (IME unmarking, closing a context
+            // menu), and that bubble reaches here since this is the
+            // focused node's ancestor -- no new keybinding needed for this
+            // path, we're just riding the existing one.
+            .on_action({
+                let weak = root_weak.clone();
+                move |_: &Escape, window, cx| {
+                    if let Some(strong) = weak.upgrade() {
+                        strong.update(cx, |this, cx| this.leave_edit(window, cx));
+                    }
+                }
+            })
+            // Fires when nothing is focused (`Some("!Input")`, see `main`'s
+            // keybinding) -- lets `Escape` close an open picker even though
+            // no `Textarea` is involved. When something *is* focused, the
+            // `Escape` handler right above already covers it.
+            .on_action({
+                let weak = root_weak.clone();
+                move |_: &LeaveEdit, window, cx| {
+                    if let Some(strong) = weak.upgrade() {
+                        strong.update(cx, |this, cx| this.leave_edit(window, cx));
                     }
                 }
             })
@@ -1248,8 +1955,10 @@ impl Render for EditorLayoutDemo {
                     let name_state =
                         self.speaker_name_states.get(&speaker).cloned().expect("ensured earlier in render()");
                     let color = speaker_color(speaker);
-                    let count = self.segments.iter().filter(|s| s.speaker == speaker).count();
+                    let count = speaker_counts.get(&speaker).copied().unwrap_or(0);
                     let merge_weak = root_weak.clone();
+                    let visibility_weak = root_weak.clone();
+                    let is_hidden = self.hidden_speakers.contains(&speaker);
 
                     let speaker_row = div()
                         .flex()
@@ -1261,6 +1970,21 @@ impl Render for EditorLayoutDemo {
                         .border_color(rgb(0x2a2a2a))
                         .child(div().flex_none().w(px(10.0)).h(px(10.0)).rounded_md().bg(color))
                         .child(Textarea::new(&name_state).flex_1().text_size(px(13.0)).appearance(false))
+                        .child(
+                            div()
+                                .id(("visibility-toggle", speaker as usize))
+                                .flex_none()
+                                .px_1()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0x9a9ba0))
+                                .cursor_pointer()
+                                .child(if is_hidden { "表示" } else { "非表示" })
+                                .on_click(move |_event, _window, cx| {
+                                    if let Some(strong) = visibility_weak.upgrade() {
+                                        strong.update(cx, |this, cx| this.toggle_speaker_visibility(speaker, cx));
+                                    }
+                                }),
+                        )
                         .child(
                             div()
                                 .id(("merge-toggle", speaker as usize))
@@ -1343,9 +2067,36 @@ impl Render for EditorLayoutDemo {
                     }
                 }
 
+                // Manually add a speaker with zero segments -- the fix for a
+                // diarization mistake where two people were left merged into
+                // one speaker (see `add_speaker`'s doc comment). Styled like
+                // `merge-confirm` above: this is a deliberate primary action,
+                // not a subtle toggle like 表示/非表示.
+                panel = panel.child(
+                    div()
+                        .id("speaker-add")
+                        .flex_none()
+                        .m_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x5b9cf6))
+                        .text_color(rgb(0x0a0a0a))
+                        .cursor_pointer()
+                        .child("+ 話者を追加")
+                        .on_click({
+                            let weak = root_weak.clone();
+                            move |_event, _window, cx| {
+                                if let Some(strong) = weak.upgrade() {
+                                    strong.update(cx, |this, cx| this.add_speaker(cx));
+                                }
+                            }
+                        }),
+                );
+
                 div()
                     .flex_none()
-                    .w(relative(0.42))
+                    .w(px(320.0))
                     .h_full()
                     .flex()
                     .flex_col()
@@ -1382,28 +2133,126 @@ impl Render for EditorLayoutDemo {
                                 .cursor_pointer()
                                 .child(label)
                         };
+                        // Small pill button for the loop controls below --
+                        // same look as the player's own `player_button`,
+                        // just sized for short text labels instead of
+                        // `zoom_button`'s fixed 26x26 (this row's own
+                        // duplicate of that style, matching the existing
+                        // convention of a small per-call-site closure rather
+                        // than a shared helper -- see `player_button`'s doc
+                        // comment).
+                        let loop_button = |label: &'static str, id: &'static str| {
+                            div()
+                                .id(id)
+                                .flex_none()
+                                .px_2()
+                                .py(px(2.0))
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x3d3e42))
+                                .bg(rgb(0x2a2b2e))
+                                .text_size(px(11.0))
+                                .cursor_pointer()
+                                .child(label)
+                        };
+                        let loop_enabled = self.loop_enabled;
+                        let loop_range_label = match (self.loop_start_ms, self.loop_end_ms) {
+                            (Some(start), Some(end)) => format!("{}–{}", format_ms(start), format_ms(end)),
+                            _ => "未設定".to_string(),
+                        };
                         div()
                             .flex_none()
+                            .w_full()
                             .flex()
                             .items_center()
-                            .gap_2()
-                            .child(div().text_size(px(11.0)).text_color(rgb(0x9a9ba0)).child("タイムライン拡大:"))
-                            .child(zoom_button("−", "zoom-out").on_click({
-                                let weak = root_weak.clone();
-                                move |_event, _window, cx| {
-                                    if let Some(strong) = weak.upgrade() {
-                                        strong.update(cx, |this, cx| this.zoom_out(cx));
-                                    }
-                                }
-                            }))
-                            .child(zoom_button("＋", "zoom-in").on_click({
-                                let weak = root_weak.clone();
-                                move |_event, _window, cx| {
-                                    if let Some(strong) = weak.upgrade() {
-                                        strong.update(cx, |this, cx| this.zoom_in(cx));
-                                    }
-                                }
-                            }))
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(0x9a9ba0))
+                                            .child("タイムライン拡大:"),
+                                    )
+                                    .child(zoom_button("−", "zoom-out").on_click({
+                                        let weak = root_weak.clone();
+                                        move |_event, _window, cx| {
+                                            if let Some(strong) = weak.upgrade() {
+                                                strong.update(cx, |this, cx| this.zoom_out(cx));
+                                            }
+                                        }
+                                    }))
+                                    .child(zoom_button("＋", "zoom-in").on_click({
+                                        let weak = root_weak.clone();
+                                        move |_event, _window, cx| {
+                                            if let Some(strong) = weak.upgrade() {
+                                                strong.update(cx, |this, cx| this.zoom_in(cx));
+                                            }
+                                        }
+                                    })),
+                            )
+                            .child(
+                                // Loop controls: IN/OUT + on/off toggle + the
+                                // currently-set range -- placed here rather
+                                // than the player controls (where this
+                                // originally lived) since looping is
+                                // conceptually an operation on the timeline,
+                                // not on playback rate/seeking (see
+                                // docs/plan.md's "ループUIをタイムライン側に
+                                // 寄せる" section).
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(loop_button("IN", "loop-in").on_click({
+                                        let weak = root_weak.clone();
+                                        move |_event, _window, cx| {
+                                            if let Some(strong) = weak.upgrade() {
+                                                strong.update(cx, |this, cx| this.set_loop_start(cx));
+                                            }
+                                        }
+                                    }))
+                                    .child(loop_button("OUT", "loop-out").on_click({
+                                        let weak = root_weak.clone();
+                                        move |_event, _window, cx| {
+                                            if let Some(strong) = weak.upgrade() {
+                                                strong.update(cx, |this, cx| this.set_loop_end(cx));
+                                            }
+                                        }
+                                    }))
+                                    .child(
+                                        div()
+                                            .id("loop-toggle")
+                                            .flex_none()
+                                            .px_2()
+                                            .py(px(2.0))
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(if loop_enabled { rgb(0x5b9cf6) } else { rgb(0x3d3e42) })
+                                            .bg(if loop_enabled { rgb(0x5b9cf6) } else { rgb(0x2a2b2e) })
+                                            .text_color(if loop_enabled { rgb(0x0a0a0a) } else { rgb(0xdddddd) })
+                                            .text_size(px(11.0))
+                                            .cursor_pointer()
+                                            .child(if loop_enabled { "ループ: ON" } else { "ループ: OFF" })
+                                            .on_click({
+                                                let weak = root_weak.clone();
+                                                move |_event, _window, cx| {
+                                                    if let Some(strong) = weak.upgrade() {
+                                                        strong.update(cx, |this, cx| this.toggle_loop(cx));
+                                                    }
+                                                }
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(0x666666))
+                                            .child(loop_range_label),
+                                    ),
+                            )
                     })
                     .child(
                         div()
@@ -1505,10 +2354,20 @@ impl Render for EditorLayoutDemo {
                                             .child(timeline_ruler(self.total_duration_ms, self.pixels_per_second))
                                             .child(
                                                 div().flex_none().h(px(28.0)).child(speaker_timeline(
-                                                    self.segments.clone(),
+                                                    self.segments
+                                                        .iter()
+                                                        .filter(|s| !self.hidden_speakers.contains(&s.speaker))
+                                                        .map(|s| SegmentBlock {
+                                                            speaker: s.speaker,
+                                                            start_ms: s.start_ms,
+                                                            end_ms: s.end_ms,
+                                                        })
+                                                        .collect(),
                                                     self.total_duration_ms,
                                                     self.pixels_per_second,
                                                     playhead_ms,
+                                                    self.loop_start_ms,
+                                                    self.loop_end_ms,
                                                     self.timeline_bounds.clone(),
                                                 )),
                                             ),
@@ -1519,19 +2378,21 @@ impl Render for EditorLayoutDemo {
                     )
                     .child(
                         div()
+                            .relative()
                             .flex_1()
                             .min_h(px(0.0))
                             .w_full()
                             .rounded_md()
                             .border_1()
                             .border_color(rgb(0x333333))
-                            .child(list),
+                            .child(list)
+                            .child(Scrollbar::vertical(&self.list_state)),
                     ),
             )
     }
 }
 
-/// Builds the `EditorLayoutDemo` entity (including its own playhead-refresh
+/// Builds the `EditorScreen` entity (including its own playhead-refresh
 /// poll loop) and returns it, without needing `Window` -- construction
 /// itself only touches `focused_row: None`/`editor: None` (no `Textarea`
 /// gets created until a row is actually focused), so this works equally
@@ -1544,7 +2405,7 @@ impl Render for EditorLayoutDemo {
 /// `project_id`/`media_id` are `None` for the dev-shortcut (`[json_path]
 /// [media_path]` CLI args) launch path, which deliberately never touches
 /// the DB -- `conn` is still a real connection in that case (simplest to
-/// always have one), just never used (`EditorLayoutDemo::persist` no-ops
+/// always have one), just never used (`EditorScreen::persist` no-ops
 /// whenever `media_id` is `None`).
 struct ProjectContext {
     conn: rusqlite::Connection,
@@ -1557,9 +2418,10 @@ struct ProjectContext {
 fn build_editor_entity(
     segments: Vec<TranscriptSegment>,
     transport: Arc<Transport>,
+    media_path: PathBuf,
     project: ProjectContext,
     cx: &mut App,
-) -> Entity<EditorLayoutDemo> {
+) -> Entity<EditorScreen> {
     let total_duration_ms = segments.iter().map(|s| s.end_ms).max().unwrap_or(0);
     let list_state = ListState::new(segments.len(), ListAlignment::Top, px(400.0));
     cx.new(|cx| {
@@ -1568,7 +2430,7 @@ fn build_editor_entity(
         // `render()`'s already-existing dispatch instead of a dedicated poll.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_millis(200)).await;
-            let alive = this.update(cx, |view: &mut EditorLayoutDemo, cx| {
+            let alive = this.update(cx, |view: &mut EditorScreen, cx| {
                 if view.transport.is_playing() {
                     cx.notify();
                 }
@@ -1586,7 +2448,7 @@ fn build_editor_entity(
         // retried on the next tick rather than silently giving up.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_millis(2000)).await;
-            let alive = this.update(cx, |view: &mut EditorLayoutDemo, cx| {
+            let alive = this.update(cx, |view: &mut EditorScreen, cx| {
                 if view.dirty {
                     view.persist(cx);
                 }
@@ -1597,12 +2459,14 @@ fn build_editor_entity(
         })
         .detach();
 
-        EditorLayoutDemo {
-            segments,
+        EditorScreen {
+            segments: Rc::new(segments),
             total_duration_ms,
             list_state,
             focused_row: None,
             editor: None,
+            editor_blur_subscription: None,
+            highlighted_row: None,
             transport,
             focus_handle: cx.focus_handle(),
             pixels_per_second: 40.0, // matches the reference HTML's default
@@ -1616,6 +2480,10 @@ fn build_editor_entity(
             last_centered_playhead_ms: None,
             speaker_name_states: HashMap::new(),
             initial_speaker_names: project.speaker_names,
+            hidden_speakers: BTreeSet::new(),
+            extra_speakers: BTreeSet::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             merge_ui: None,
             row_speaker_picker_open_for: None,
             badge_bounds: Rc::new(RefCell::new(HashMap::new())),
@@ -1625,6 +2493,11 @@ fn build_editor_entity(
             speaker_db_ids: project.speaker_db_ids,
             dirty: false,
             save_error: None,
+            media_path,
+            export_picker_open: false,
+            loop_start_ms: None,
+            loop_end_ms: None,
+            loop_enabled: false,
         }
     })
 }
@@ -1650,6 +2523,11 @@ enum UploadStatus {
 /// `render()` on `AppScreen` (see that doc comment for why, over
 /// `Window::replace_root`).
 struct UploadScreen {
+    /// The project this upload's resulting transcript will be added to
+    /// (see docs/plan.md's "プロジェクトの上位概念化" section) -- always a
+    /// real, already-existing project, since `AppRoot::open_upload` is only
+    /// reachable from `ProjectDetail`.
+    project_id: String,
     media_path: Option<PathBuf>,
     status: UploadStatus,
 }
@@ -1663,12 +2541,73 @@ struct UploadScreen {
 struct ProjectsScreen {
     projects: Vec<asr_core::store::projects::ProjectSummary>,
     error: Option<String>,
+    /// The "新規作成" name input -- `None` until the first render (needs
+    /// `Window` to construct, same reason `ProjectDetailScreen`'s term
+    /// editors are created lazily in `AppRoot::render` rather than up
+    /// front).
+    new_project_name: Option<Entity<InputState>>,
+}
+
+/// A project's fields that aren't directly backed by a `Textarea` in the
+/// terms panel (see `ProjectDetailScreen::term_meta`) -- `category`/
+/// `weight` aren't edited from the UI at all (yet) and are simply
+/// round-tripped unchanged; `enabled` has its own toggle but no dedicated
+/// `Textarea`. `initial_surface`/`initial_reading_kana` seed
+/// `term_editors`' lazy creation and are otherwise unused once that's
+/// happened (the live `Textarea`s are the source of truth after that
+/// point).
+struct TermMeta {
+    initial_surface: String,
+    initial_reading_kana: String,
+    category: Option<String>,
+    weight: f32,
+    enabled: bool,
+}
+
+/// A project's detail screen: its term dictionary (see docs/plan.md's
+/// "プロジェクトの上位概念化" section for why terms live here rather than
+/// on `EditorScreen`) plus the list of transcripts registered under it.
+/// Like `ProjectsScreen`/`UploadScreen`, a plain field of `AppRoot` rather
+/// than a standalone `Entity`.
+struct ProjectDetailScreen {
+    project_id: String,
+    project_name: String,
+    transcripts: Vec<asr_core::store::projects::TranscriptSummary>,
+    error: Option<String>,
+    /// Ids of every registered term, in the order `store::terms::load_all_terms`
+    /// returned them (weight descending) -- the terms panel's row order.
+    /// Structural changes (`AppRoot::add_term`/`delete_term`) update this
+    /// list directly; nothing else derives it.
+    term_order: Vec<String>,
+    /// Per-term data not backed by a live `Textarea` (unlike surface/
+    /// reading_kana, which live in `term_editors` once created) -- also
+    /// doubles as the seed values for that lazy creation.
+    term_meta: HashMap<String, TermMeta>,
+    /// One live (surface, reading_kana) `Textarea` pair per term in
+    /// `term_order`, lazily created in `AppRoot::render` the same way
+    /// `EditorScreen::speaker_name_states` is -- kept alive for the whole
+    /// time this screen is showing, since there are only ever a handful of
+    /// terms.
+    term_editors: HashMap<String, (Entity<TextareaState>, Entity<TextareaState>)>,
+    /// The terms panel's "add a new term" form fields -- `None` until the
+    /// first render (needs `Window` to construct).
+    new_term_inputs: Option<(Entity<TextareaState>, Entity<TextareaState>)>,
+    /// Set whenever a term's surface/reading_kana `Textarea` changes (via
+    /// `cx.observe`); cleared by `AppRoot`'s periodic autosave timer (see
+    /// `main`) once persisted. Structural changes (add/delete/toggle
+    /// enabled) write the DB immediately instead and don't touch this.
+    dirty: bool,
 }
 
 enum AppScreen {
     Projects(ProjectsScreen),
+    /// A single project's detail: its term dictionary and transcript list.
+    /// Reached via "開く" on `Projects` or "新規作成" (a project starts
+    /// life here, empty, before any transcript exists) -- see
+    /// docs/plan.md's "プロジェクトの上位概念化" section.
+    ProjectDetail(Box<ProjectDetailScreen>),
     Upload(UploadScreen),
-    Editor(Entity<EditorLayoutDemo>),
+    Editor(Entity<EditorScreen>),
     /// The API-key settings screen -- reachable via a persistent "設定
     /// (APIキー)" link on `Projects` (originally lived only on `Upload`,
     /// which the user pointed out made it unreachable without going through
@@ -1703,7 +2642,7 @@ struct AppRoot {
     screen: AppScreen,
     /// This window's own connection to the app DB (`app_db_path()`) -- used
     /// directly for the project list and to create a new project once a
-    /// pipeline run succeeds. Each `EditorLayoutDemo` opens its own separate
+    /// pipeline run succeeds. Each `EditorScreen` opens its own separate
     /// connection to the same file rather than sharing this one (see that
     /// struct's `conn` doc comment for why); SQLite's WAL mode (enabled in
     /// `store::open`) makes that safe.
@@ -1779,43 +2718,126 @@ impl AppRoot {
     const MODELS_DIR: &'static str = "../../models";
     const ALLOWED_EXTENSIONS: &'static [&'static str] = &["mp4", "mov", "m4a", "wav", "mp3", "aac"];
 
-    /// "新規作成" -- navigates from the project list to the upload screen.
-    fn open_upload(&mut self, cx: &mut Context<Self>) {
-        self.screen = AppScreen::Upload(UploadScreen { media_path: None, status: UploadStatus::Idle });
+    /// "新規作成" -- creates a new, empty project (see docs/plan.md's
+    /// "プロジェクトの上位概念化" section) and opens its detail screen. A
+    /// no-op if the name field is blank.
+    fn create_project(&mut self, cx: &mut Context<Self>) {
+        let AppScreen::Projects(projects) = &self.screen else { return };
+        let Some(name_input) = projects.new_project_name.clone() else { return };
+        let name = name_input.read(cx).text().to_string();
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        match asr_core::store::projects::create_project(&self.conn, name) {
+            Ok(project_id) => self.open_project_detail(project_id, cx),
+            Err(err) => {
+                if let AppScreen::Projects(projects) = &mut self.screen {
+                    projects.error = Some(format!("プロジェクトの作成に失敗しました: {err:#}"));
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// "開く" on a project, or landing here right after `create_project` --
+    /// (re)loads its transcript list and term dictionary and shows
+    /// `ProjectDetail`. A failure (the DB read itself fails) is reported
+    /// inline on the project list rather than crashing or silently doing
+    /// nothing.
+    fn open_project_detail(&mut self, project_id: String, cx: &mut Context<Self>) {
+        let result: anyhow::Result<ProjectDetailScreen> = (|| {
+            let name: String =
+                self.conn.query_row("SELECT name FROM projects WHERE id = ?1", [&project_id], |row| row.get(0))?;
+            let transcripts = asr_core::store::projects::list_transcripts(&self.conn, &project_id)?;
+            let terms = asr_core::terms::store::load_all_terms(&self.conn, &project_id)?;
+            let term_order = terms.iter().map(|row| row.id.clone()).collect();
+            let term_meta = terms
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.id,
+                        TermMeta {
+                            initial_surface: row.term.surface,
+                            initial_reading_kana: row.term.reading_kana.unwrap_or_default(),
+                            category: row.term.category,
+                            weight: row.term.weight,
+                            enabled: row.term.enabled,
+                        },
+                    )
+                })
+                .collect();
+            Ok(ProjectDetailScreen {
+                project_id,
+                project_name: name,
+                transcripts,
+                error: None,
+                term_order,
+                term_meta,
+                term_editors: HashMap::new(),
+                new_term_inputs: None,
+                dirty: false,
+            })
+        })();
+        match result {
+            Ok(detail) => self.screen = AppScreen::ProjectDetail(Box::new(detail)),
+            Err(err) => {
+                if let AppScreen::Projects(projects) = &mut self.screen {
+                    projects.error = Some(format!("プロジェクトを開けませんでした: {err:#}"));
+                }
+            }
+        }
         cx.notify();
     }
 
-    /// "← プロジェクト一覧に戻る" on the upload screen -- re-lists projects
-    /// (cheap, and picks up anything created elsewhere) and returns to
-    /// `Projects`. The caller (render's click handler) is responsible for
-    /// not invoking this while a pipeline is actually running: the
-    /// background worker in `start_pipeline` keeps going regardless of
-    /// which screen is showing, but its polling loop bails out the instant
-    /// `self.screen` isn't `Upload` anymore, silently discarding whatever
-    /// it produces -- so this method itself doesn't re-check that, to keep
-    /// the single source of truth for "is it safe to navigate away" at the
-    /// one call site instead of duplicating the check here too.
+    /// "← プロジェクト一覧" -- re-lists projects (cheap, and picks up
+    /// anything created elsewhere) and returns to `Projects`.
     fn back_to_projects(&mut self, cx: &mut Context<Self>) {
         match asr_core::store::projects::list_projects(&self.conn) {
-            Ok(projects) => self.screen = AppScreen::Projects(ProjectsScreen { projects, error: None }),
+            Ok(projects) => {
+                self.screen = AppScreen::Projects(ProjectsScreen { projects, error: None, new_project_name: None })
+            }
             Err(err) => {
                 self.screen = AppScreen::Projects(ProjectsScreen {
                     projects: Vec::new(),
                     error: Some(format!("プロジェクト一覧の取得に失敗しました: {err:#}")),
+                    new_project_name: None,
                 })
             }
         }
         cx.notify();
     }
 
-    /// "開く" on a past project -- reloads it from the DB and jumps
-    /// straight to the editor. A failure (the media file was moved or
+    /// "← プロジェクトに戻る" on the editor/upload screens -- returns to
+    /// that project's detail screen (re-reading its transcript list and
+    /// term dictionary, so anything changed elsewhere shows up). The
+    /// caller (render's click handler) is responsible for not invoking
+    /// this while a pipeline is actually running -- `start_pipeline`'s
+    /// polling loop bails out the instant `self.screen` isn't `Upload`
+    /// anymore, silently discarding whatever it produces, so this method
+    /// itself doesn't re-check that, to keep the single source of truth
+    /// for "is it safe to navigate away" at the one call site instead of
+    /// duplicating the check here too.
+    fn back_to_project_detail(&mut self, project_id: String, cx: &mut Context<Self>) {
+        self.open_project_detail(project_id, cx);
+    }
+
+    /// "新規アップロード" on a project's detail screen -- navigates to the
+    /// upload screen, scoped to this project.
+    fn open_upload(&mut self, project_id: String, cx: &mut Context<Self>) {
+        self.screen = AppScreen::Upload(UploadScreen { project_id, media_path: None, status: UploadStatus::Idle });
+        cx.notify();
+    }
+
+    /// "開く" on one of a project's transcripts -- reloads it from the DB
+    /// and jumps to the editor. A failure (the media file was moved or
     /// deleted since, or the DB read itself fails) is reported inline on
-    /// the project list rather than crashing or silently doing nothing.
-    fn open_project(&mut self, project_id: String, cx: &mut Context<Self>) {
-        let result: anyhow::Result<Entity<EditorLayoutDemo>> = (|| {
-            let (media_id, media_path, segments, speaker_names, speaker_db_ids) =
-                asr_core::store::projects::load_project(&self.conn, &project_id)?;
+    /// the project detail screen rather than crashing or silently doing
+    /// nothing.
+    fn open_media(&mut self, project_id: String, media_id: String, cx: &mut Context<Self>) {
+        let result: anyhow::Result<Entity<EditorScreen>> = (|| {
+            let (media_path, segments, speaker_names, speaker_db_ids) =
+                asr_core::store::projects::load_media(&self.conn, &media_id)?;
             let transport = Transport::new(&media_path)
                 .map_err(|err| anyhow::anyhow!("音声の読み込みに失敗しました: {err:#}"))?;
             let project = ProjectContext {
@@ -1825,17 +2847,138 @@ impl AppRoot {
                 speaker_db_ids,
                 speaker_names,
             };
-            Ok(build_editor_entity(segments, Arc::new(transport), project, cx))
+            Ok(build_editor_entity(segments, Arc::new(transport), media_path, project, cx))
         })();
         match result {
             Ok(editor) => self.screen = AppScreen::Editor(editor),
             Err(err) => {
-                if let AppScreen::Projects(projects) = &mut self.screen {
-                    projects.error = Some(format!("プロジェクトを開けませんでした: {err:#}"));
+                if let AppScreen::ProjectDetail(detail) = &mut self.screen {
+                    detail.error = Some(format!("文字起こしを開けませんでした: {err:#}"));
                 }
             }
         }
         cx.notify();
+    }
+
+    /// Registers a new term from the terms panel's "add" form (see
+    /// `ProjectDetailScreen::new_term_inputs`), reading the current text of
+    /// its two `Textarea`s. A no-op if the surface field is blank (nothing
+    /// to register) or if `self.screen` isn't `ProjectDetail`.
+    ///
+    /// Mints the `terms` DB row eagerly/synchronously (structural change,
+    /// matching `EditorScreen::add_speaker`'s convention) -- surface/reading
+    /// edits to an *existing* row instead sync lazily via the autosave
+    /// timer (see `main`).
+    fn add_term(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let AppScreen::ProjectDetail(detail) = &self.screen else { return };
+        let Some((surface_state, reading_state)) = detail.new_term_inputs.clone() else { return };
+        let project_id = detail.project_id.clone();
+        let surface = surface_state.read(cx).text().to_string().trim().to_string();
+        if surface.is_empty() {
+            return;
+        }
+        let reading = reading_state.read(cx).text().to_string().trim().to_string();
+        let reading_kana = if reading.is_empty() { None } else { Some(reading) };
+        let term = asr_core::terms::Term {
+            surface: surface.clone(),
+            reading_kana: reading_kana.clone(),
+            category: None,
+            weight: 1.0,
+            enabled: true,
+        };
+        match asr_core::terms::store::add_term(&self.conn, &project_id, &term) {
+            Ok(id) => {
+                let AppScreen::ProjectDetail(detail) = &mut self.screen else { return };
+                detail.term_meta.insert(
+                    id.clone(),
+                    TermMeta {
+                        initial_surface: surface,
+                        initial_reading_kana: reading_kana.unwrap_or_default(),
+                        category: None,
+                        weight: 1.0,
+                        enabled: true,
+                    },
+                );
+                detail.term_order.push(id);
+            }
+            Err(err) => {
+                if let AppScreen::ProjectDetail(detail) = &mut self.screen {
+                    detail.error = Some(format!("用語の追加に失敗しました: {err:#}"));
+                }
+                return;
+            }
+        }
+        // Clear the form for the next entry (the new row's own editors are
+        // created fresh next render, seeded from `term_meta` above -- see
+        // `render`'s lazy-creation loop).
+        surface_state.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        reading_state.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        cx.notify();
+    }
+
+    /// Flips a term's enabled flag -- structural (affects whether it's sent
+    /// to the ASR provider / used for post-hoc correction on the next
+    /// pipeline run), so applied to the DB immediately rather than waiting
+    /// for the autosave tick, same as `add_term`/`delete_term`.
+    fn toggle_term_enabled(&mut self, id: String, cx: &mut Context<Self>) {
+        let AppScreen::ProjectDetail(detail) = &mut self.screen else { return };
+        let Some(meta) = detail.term_meta.get_mut(&id) else { return };
+        meta.enabled = !meta.enabled;
+        let enabled = meta.enabled;
+        if let Err(err) = asr_core::terms::store::set_enabled(&self.conn, &id, enabled) {
+            detail.error = Some(format!("用語の有効/無効切り替えに失敗しました: {err:#}"));
+        }
+        cx.notify();
+    }
+
+    /// Deletes a term outright -- no confirmation step, matching
+    /// `EditorScreen::delete_segment`'s reasoning (this app doesn't have a
+    /// dedicated undo for terms, but a mistaken delete is cheap to notice
+    /// and re-add).
+    fn delete_term(&mut self, id: String, cx: &mut Context<Self>) {
+        let AppScreen::ProjectDetail(detail) = &mut self.screen else { return };
+        detail.term_order.retain(|t| t != &id);
+        detail.term_meta.remove(&id);
+        detail.term_editors.remove(&id);
+        if let Err(err) = asr_core::terms::store::delete_term(&self.conn, &id) {
+            detail.error = Some(format!("用語の削除に失敗しました: {err:#}"));
+        }
+        cx.notify();
+    }
+
+    /// Writes every dirty term's surface/reading_kana back to the DB --
+    /// called only by the periodic autosave timer (see `main`), same
+    /// "dirty flag + timer" convention as `EditorScreen::persist`.
+    /// `category`/`weight` have no editor of their own and are simply
+    /// round-tripped unchanged from `term_meta`.
+    fn persist_project_detail(&mut self, cx: &App) {
+        let AppScreen::ProjectDetail(detail) = &mut self.screen else { return };
+        if !detail.dirty {
+            return;
+        }
+        for (id, (surface_state, reading_state)) in &detail.term_editors {
+            let Some(meta) = detail.term_meta.get(id) else { continue };
+            let surface = surface_state.read(cx).text().to_string().trim().to_string();
+            if surface.is_empty() {
+                // Don't persist a blanked-out surface -- the delete button
+                // is the intended way to remove a term, not clearing its text.
+                continue;
+            }
+            let reading = reading_state.read(cx).text().to_string().trim().to_string();
+            let term = asr_core::terms::Term {
+                surface,
+                reading_kana: if reading.is_empty() { None } else { Some(reading) },
+                category: meta.category.clone(),
+                weight: meta.weight,
+                enabled: meta.enabled,
+            };
+            if let Err(err) = asr_core::terms::store::update_term(&self.conn, id, &term) {
+                detail.error = Some(format!("用語の保存に失敗しました: {err:#}"));
+                return;
+            }
+        }
+        detail.error = None;
+        detail.dirty = false;
     }
 
     /// Opens the settings screen from wherever `self.screen` currently is
@@ -1856,7 +2999,7 @@ impl AppRoot {
         // very next statement and is never actually rendered.
         let previous = std::mem::replace(
             &mut self.screen,
-            AppScreen::Projects(ProjectsScreen { projects: Vec::new(), error: None }),
+            AppScreen::Projects(ProjectsScreen { projects: Vec::new(), error: None, new_project_name: None }),
         );
         self.screen = AppScreen::Settings { api_key_input, error: None, return_to: Box::new(previous) };
         cx.notify();
@@ -1872,7 +3015,7 @@ impl AppRoot {
         }
         let AppScreen::Settings { return_to, .. } = std::mem::replace(
             &mut self.screen,
-            AppScreen::Projects(ProjectsScreen { projects: Vec::new(), error: None }),
+            AppScreen::Projects(ProjectsScreen { projects: Vec::new(), error: None, new_project_name: None }),
         ) else {
             unreachable!("checked above");
         };
@@ -1955,6 +3098,7 @@ impl AppRoot {
         if matches!(upload.status, UploadStatus::Running(_)) {
             return; // already running
         }
+        let worker_project_id = upload.project_id.clone();
 
         let api_key = match load_api_key() {
             Ok(Some(key)) => key,
@@ -1982,6 +3126,16 @@ impl AppRoot {
             .spawn_dedicated(move |_executor| async move {
                 let result: anyhow::Result<Vec<TranscriptSegment>> = (|| {
                     let models_dir = PathBuf::from(AppRoot::MODELS_DIR);
+                    // A fresh connection scoped to this background task --
+                    // same "WAL mode makes concurrent connections safe"
+                    // precedent `EditorScreen`/`ProjectDetailScreen` rely on.
+                    // The project (and therefore its `terms`) already
+                    // exists by the time any upload can start (see
+                    // `AppRoot::open_upload`), so this is the fix that
+                    // actually lets registered terms bias this run's
+                    // keyterms/correction -- see docs/plan.md's
+                    // "プロジェクトの上位概念化" section.
+                    let terms_conn = open_app_db()?;
                     let segments = asr_core::pipeline::run_full_pipeline(
                         &worker_media_path,
                         api_key,
@@ -1991,8 +3145,8 @@ impl AppRoot {
                         60_000, // max_merged_ms, matches asr-cli's default
                         300,    // pad_ms, matches asr-cli's default
                         "ja",
-                        None, // terms DB: wired in once the term panel exists (docs/plan.md)
-                        0.7,  // correction_threshold, unused while terms_db is None
+                        Some((&terms_conn, worker_project_id.as_str())),
+                        0.7, // correction_threshold
                         &mut |stage| {
                             *worker_progress.lock().unwrap() = PipelineProgress::Running(stage);
                         },
@@ -2054,18 +3208,25 @@ impl AppRoot {
                     let _ = this.update(cx, |this, cx| {
                         match transport {
                             Ok(transport) => {
-                                // Create the project + its initial save before
-                                // handing off to the editor, so a real
-                                // (paid, time-costly) pipeline run is never
-                                // lost the moment the window closes -- the
-                                // gap this whole feature exists to close.
-                                let saved: anyhow::Result<Entity<EditorLayoutDemo>> = (|| {
-                                    let name = media_path
-                                        .file_stem()
-                                        .map(|s| s.to_string_lossy().to_string())
-                                        .unwrap_or_else(|| "無題のプロジェクト".to_string());
-                                    let (project_id, media_id) =
-                                        asr_core::store::projects::create_project(&this.conn, &name, &media_path)?;
+                                // Add this transcript to the already-existing
+                                // project (see docs/plan.md's "プロジェクト
+                                // の上位概念化" section -- the project itself
+                                // was created up front, before this upload
+                                // ever started, specifically so its `terms`
+                                // could bias this very run) before handing
+                                // off to the editor, so a real (paid,
+                                // time-costly) pipeline run is never lost the
+                                // moment the window closes.
+                                let saved: anyhow::Result<Entity<EditorScreen>> = (|| {
+                                    let AppScreen::Upload(upload) = &this.screen else {
+                                        anyhow::bail!("アップロード画面以外からパイプラインが完了しました");
+                                    };
+                                    let project_id = upload.project_id.clone();
+                                    let media_id = asr_core::store::projects::create_media(
+                                        &this.conn,
+                                        &project_id,
+                                        &media_path,
+                                    )?;
                                     let distinct_speakers: BTreeSet<i32> =
                                         segments.iter().map(|s| s.speaker).collect();
                                     let speaker_names: HashMap<i32, String> =
@@ -2086,7 +3247,7 @@ impl AppRoot {
                                         speaker_db_ids,
                                         speaker_names,
                                     };
-                                    Ok(build_editor_entity(segments, Arc::new(transport), project, cx))
+                                    Ok(build_editor_entity(segments, Arc::new(transport), media_path, project, cx))
                                 })();
                                 match saved {
                                     Ok(editor) => this.screen = AppScreen::Editor(editor),
@@ -2115,50 +3276,104 @@ impl AppRoot {
 }
 
 impl Render for AppRoot {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let AppScreen::Editor(editor) = &self.screen {
             // A thin header above the delegated editor entity (still a real
             // `Entity<V>`, covered by `IntoElement` directly --
             // gpui-pre-0.3.4/src/view.rs) rather than anything inside
-            // `EditorLayoutDemo` itself -- keeps screen-level navigation a
+            // `EditorScreen` itself -- keeps screen-level navigation a
             // concern of `AppRoot` alone, matching how `Settings`'s
             // `return_to` already works. `editor`'s own root uses
             // `size_full()`, which still resolves correctly nested under a
             // `flex_1().min_h(px(0.0))` sibling of this header.
             let weak = cx.weak_entity();
             let editor_for_back = editor.clone();
-            return div()
-                .size_full()
+            // `None` only for the dev-shortcut launch path (see
+            // `EditorScreen::project_id`'s doc comment) -- there's no
+            // project detail screen to go back to in that case, so this
+            // falls back to the top-level project list instead.
+            let project_id_for_back = editor.read(cx).project_id.clone();
+            let export_picker_open = editor.read(cx).export_picker_open;
+            let save_error = editor.read(cx).save_error.clone();
+
+            let mut header = div()
+                .flex_none()
                 .flex()
-                .flex_col()
+                .items_center()
+                .justify_between()
+                .px_2()
+                .py_1()
+                .bg(rgb(0x1a1a1a))
                 .child(
                     div()
+                        .id("back-to-projects-from-editor")
+                        .text_size(px(12.0))
+                        .text_color(rgb(0x9a9ba0))
+                        .cursor_pointer()
+                        .child("← プロジェクトに戻る")
+                        .on_click(move |_event, _window, cx| {
+                            // Force a save before leaving -- the most
+                            // recent edit may not have been picked up
+                            // by the 2-second autosave timer yet.
+                            editor_for_back.update(cx, |view, cx| view.persist(cx));
+                            if let Some(strong) = weak.upgrade() {
+                                strong.update(cx, |this, cx| match project_id_for_back.clone() {
+                                    Some(project_id) => this.back_to_project_detail(project_id, cx),
+                                    None => this.back_to_projects(cx),
+                                });
+                            }
+                        }),
+                );
+
+            let mut export_group = div().flex().items_center().gap_2().child(
+                div()
+                    .id("toggle-export")
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x9a9ba0))
+                    .cursor_pointer()
+                    .child("書き出し")
+                    .on_click({
+                        let editor = editor.clone();
+                        move |_event, _window, cx| {
+                            editor.update(cx, |view, cx| view.toggle_export_picker(cx));
+                        }
+                    }),
+            );
+            if export_picker_open {
+                for format in ExportFormat::ALL {
+                    let editor = editor.clone();
+                    export_group = export_group.child(
+                        div()
+                            .id(format!("export-format-{}", format.extension()))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(0x3d3e42))
+                            .text_size(px(11.0))
+                            .cursor_pointer()
+                            .child(format.label())
+                            .on_click(move |_event, _window, cx| {
+                                editor.update(cx, |view, cx| view.export(format, cx));
+                            }),
+                    );
+                }
+            }
+            header = header.child(export_group);
+
+            let mut root = div().size_full().flex().flex_col().child(header);
+            if let Some(error) = save_error {
+                root = root.child(
+                    div()
                         .flex_none()
-                        .flex()
-                        .items_center()
                         .px_2()
                         .py_1()
-                        .bg(rgb(0x1a1a1a))
-                        .child(
-                            div()
-                                .id("back-to-projects-from-editor")
-                                .text_size(px(12.0))
-                                .text_color(rgb(0x9a9ba0))
-                                .cursor_pointer()
-                                .child("← プロジェクト一覧に戻る")
-                                .on_click(move |_event, _window, cx| {
-                                    // Force a save before leaving -- the most
-                                    // recent edit may not have been picked up
-                                    // by the 2-second autosave timer yet.
-                                    editor_for_back.update(cx, |view, cx| view.persist(cx));
-                                    if let Some(strong) = weak.upgrade() {
-                                        strong.update(cx, |this, cx| this.back_to_projects(cx));
-                                    }
-                                }),
-                        ),
-                )
-                .child(div().flex_1().min_h(px(0.0)).child(editor.clone()))
-                .into_any_element();
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xff8888))
+                        .child(error),
+                );
+            }
+            return root.child(div().flex_1().min_h(px(0.0)).child(editor.clone())).into_any_element();
         }
 
         let weak = cx.weak_entity();
@@ -2246,6 +3461,15 @@ impl Render for AppRoot {
                 .into_any_element();
         }
 
+        // Lazily create the "新規作成" name input (needs `Window`) -- same
+        // pattern as `ProjectDetailScreen`'s term editors below.
+        if let AppScreen::Projects(projects) = &mut self.screen {
+            if projects.new_project_name.is_none() {
+                projects.new_project_name =
+                    Some(cx.new(|cx| InputState::new(window, cx).placeholder("新しいプロジェクトの名前")));
+            }
+        }
+
         if let AppScreen::Projects(projects) = &self.screen {
             let mut list_el = div().flex().flex_col().gap_2();
             if projects.projects.is_empty() {
@@ -2253,7 +3477,7 @@ impl Render for AppRoot {
                     div()
                         .text_color(rgb(0x9a9ba0))
                         .text_size(px(13.0))
-                        .child("まだプロジェクトがありません。「新規作成」から始めてください。"),
+                        .child("まだプロジェクトがありません。上の欄から新規作成してください。"),
                 );
             }
             for p in &projects.projects {
@@ -2276,10 +3500,9 @@ impl Render for AppRoot {
                                 .gap(px(2.0))
                                 .child(div().text_size(px(14.0)).child(p.name.clone()))
                                 .child(div().text_size(px(11.0)).text_color(rgb(0x9a9ba0)).child(format!(
-                                    "{} ・ {}件 ・ {}",
+                                    "{} ・ 文字起こし{}件",
                                     p.created_at.replacen('T', " ", 1),
-                                    p.segment_count,
-                                    p.media_path
+                                    p.transcript_count
                                 ))),
                         )
                         .child(
@@ -2296,7 +3519,7 @@ impl Render for AppRoot {
                                 .on_click(move |_event, _window, cx| {
                                     if let Some(strong) = weak_open.upgrade() {
                                         let id = id.clone();
-                                        strong.update(cx, |this, cx| this.open_project(id, cx));
+                                        strong.update(cx, |this, cx| this.open_project_detail(id, cx));
                                     }
                                 }),
                         ),
@@ -2319,44 +3542,56 @@ impl Render for AppRoot {
                         .child(div().text_size(px(18.0)).child("プロジェクト"))
                         .child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap_4()
-                                .child(
-                                    div()
-                                        .id("open-settings-from-projects")
-                                        .text_size(px(12.0))
-                                        .text_color(rgb(0x9a9ba0))
-                                        .cursor_pointer()
-                                        .child("設定 (APIキー)")
-                                        .on_click({
-                                            let weak = weak.clone();
-                                            move |_event, window, cx| {
-                                                if let Some(strong) = weak.upgrade() {
-                                                    strong.update(cx, |this, cx| this.open_settings(window, cx));
-                                                }
-                                            }
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .id("new-project")
-                                        .px_3()
-                                        .py_2()
-                                        .rounded_md()
-                                        .bg(rgb(0x5b9cf6))
-                                        .text_color(rgb(0x0a0a0a))
-                                        .cursor_pointer()
-                                        .child("新規作成")
-                                        .on_click({
-                                            let weak = weak.clone();
-                                            move |_event, _window, cx| {
-                                                if let Some(strong) = weak.upgrade() {
-                                                    strong.update(cx, |this, cx| this.open_upload(cx));
-                                                }
-                                            }
-                                        }),
-                                ),
+                                .id("open-settings-from-projects")
+                                .text_size(px(12.0))
+                                .text_color(rgb(0x9a9ba0))
+                                .cursor_pointer()
+                                .child("設定 (APIキー)")
+                                .on_click({
+                                    let weak = weak.clone();
+                                    move |_event, window, cx| {
+                                        if let Some(strong) = weak.upgrade() {
+                                            strong.update(cx, |this, cx| this.open_settings(window, cx));
+                                        }
+                                    }
+                                }),
+                        ),
+                )
+                // "新規作成": a name-only project (see docs/plan.md's
+                // "プロジェクトの上位概念化" section -- a project's term
+                // dictionary needs to exist before any upload, so creation
+                // is now just a name, with no file picker involved).
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .children(
+                            projects
+                                .new_project_name
+                                .clone()
+                                .map(|input| Input::new(&input).flex_1().text_size(px(13.0))),
+                        )
+                        .child(
+                            div()
+                                .id("new-project")
+                                .flex_none()
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .bg(rgb(0x5b9cf6))
+                                .text_color(rgb(0x0a0a0a))
+                                .cursor_pointer()
+                                .child("新規作成")
+                                .on_click({
+                                    let weak = weak.clone();
+                                    move |_event, _window, cx| {
+                                        if let Some(strong) = weak.upgrade() {
+                                            strong.update(cx, |this, cx| this.create_project(cx));
+                                        }
+                                    }
+                                }),
                         ),
                 );
             if let Some(error) = &projects.error {
@@ -2364,6 +3599,302 @@ impl Render for AppRoot {
             }
             return root
                 .child(div().id("projects-list").flex_1().min_h(px(0.0)).overflow_y_scroll().child(list_el))
+                .into_any_element();
+        }
+
+        if matches!(self.screen, AppScreen::ProjectDetail(_)) {
+            // Lazily create every term's (surface, reading_kana) editor
+            // pair, plus the "add a new term" form's own fields -- same
+            // pattern `EditorScreen::speaker_name_states` uses (run every
+            // render, no-op past the first time each id is seen). Cloned to
+            // a local `Vec` first so the loop body can freely mutate
+            // `detail.term_editors` without fighting the borrow checker
+            // over borrowing `detail.term_order` at the same time.
+            if let AppScreen::ProjectDetail(detail) = &mut self.screen {
+                for id in detail.term_order.clone() {
+                    if detail.term_editors.contains_key(&id) {
+                        continue;
+                    }
+                    let Some(meta) = detail.term_meta.get(&id) else { continue };
+                    let initial_surface = meta.initial_surface.clone();
+                    let initial_reading = meta.initial_reading_kana.clone();
+                    let surface_state = cx.new(|cx| {
+                        let mut s = TextareaState::new(window, cx).auto_grow(1, 1);
+                        s.set_value(initial_surface, window, cx);
+                        s
+                    });
+                    let reading_state = cx.new(|cx| {
+                        let mut s = TextareaState::new(window, cx).auto_grow(1, 1);
+                        s.set_value(initial_reading, window, cx);
+                        s
+                    });
+                    // Term edits have no dedicated commit function -- the
+                    // Textarea is always live-bound -- so observe both
+                    // fields to flip `dirty` for the autosave timer (see
+                    // `main`) to pick up.
+                    cx.observe(&surface_state, |this: &mut AppRoot, _state, cx| {
+                        if let AppScreen::ProjectDetail(detail) = &mut this.screen {
+                            detail.dirty = true;
+                        }
+                        cx.notify();
+                    })
+                    .detach();
+                    cx.observe(&reading_state, |this: &mut AppRoot, _state, cx| {
+                        if let AppScreen::ProjectDetail(detail) = &mut this.screen {
+                            detail.dirty = true;
+                        }
+                        cx.notify();
+                    })
+                    .detach();
+                    detail.term_editors.insert(id, (surface_state, reading_state));
+                }
+                if detail.new_term_inputs.is_none() {
+                    let surface_state =
+                        cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 1).placeholder("表記"));
+                    let reading_state = cx
+                        .new(|cx| TextareaState::new(window, cx).auto_grow(1, 1).placeholder("読み（カタカナ、任意）"));
+                    detail.new_term_inputs = Some((surface_state, reading_state));
+                }
+            }
+
+            let AppScreen::ProjectDetail(detail) = &self.screen else { unreachable!("checked above") };
+
+            let mut terms_panel = div()
+                .id("terms-panel")
+                .flex_1()
+                .min_h(px(0.0))
+                .w_full()
+                .overflow_y_scroll()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(0x333333))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_none()
+                        .px_2()
+                        .py_1()
+                        .text_size(px(11.0))
+                        .text_color(rgb(0x9a9ba0))
+                        .child("用語辞書"),
+                );
+
+            for id in &detail.term_order {
+                let Some((surface_state, reading_state)) = detail.term_editors.get(id).cloned() else {
+                    continue;
+                };
+                let Some(meta) = detail.term_meta.get(id) else { continue };
+                let enabled = meta.enabled;
+                let toggle_weak = weak.clone();
+                let toggle_id = id.clone();
+                let delete_weak = weak.clone();
+                let delete_id = id.clone();
+
+                terms_panel = terms_panel.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(rgb(0x2a2a2a))
+                        .opacity(if enabled { 1.0 } else { 0.45 })
+                        .child(Textarea::new(&surface_state).flex_1().text_size(px(13.0)).appearance(false))
+                        .child(Textarea::new(&reading_state).flex_1().text_size(px(12.0)).appearance(false))
+                        .child(
+                            div()
+                                .id(format!("term-enabled-{id}"))
+                                .flex_none()
+                                .px_1()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0x9a9ba0))
+                                .cursor_pointer()
+                                .child(if enabled { "有効" } else { "無効" })
+                                .on_click(move |_event, _window, cx| {
+                                    if let Some(strong) = toggle_weak.upgrade() {
+                                        strong.update(cx, |this, cx| this.toggle_term_enabled(toggle_id.clone(), cx));
+                                    }
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id(format!("term-delete-{id}"))
+                                .flex_none()
+                                .px_1()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0x9a9ba0))
+                                .cursor_pointer()
+                                .child("削除")
+                                .on_click(move |_event, _window, cx| {
+                                    if let Some(strong) = delete_weak.upgrade() {
+                                        strong.update(cx, |this, cx| this.delete_term(delete_id.clone(), cx));
+                                    }
+                                }),
+                        ),
+                );
+            }
+
+            // Always-present "add a new term" form footer -- an explicit
+            // "追加" button rather than committing on Enter or blur,
+            // matching the app's general "structural operations are
+            // explicit" convention (see e.g. `EditorScreen::delete_segment`'s
+            // doc comment).
+            if let Some((new_surface_state, new_reading_state)) = detail.new_term_inputs.clone() {
+                terms_panel = terms_panel.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .child(Textarea::new(&new_surface_state).flex_1().text_size(px(13.0)))
+                        .child(Textarea::new(&new_reading_state).flex_1().text_size(px(13.0)))
+                        .child(
+                            div()
+                                .id("term-add")
+                                .flex_none()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x5b9cf6))
+                                .text_color(rgb(0x0a0a0a))
+                                .cursor_pointer()
+                                .child("追加")
+                                .on_click({
+                                    let weak = weak.clone();
+                                    move |_event, window, cx| {
+                                        if let Some(strong) = weak.upgrade() {
+                                            strong.update(cx, |this, cx| this.add_term(window, cx));
+                                        }
+                                    }
+                                }),
+                        ),
+                );
+            }
+
+            let mut transcript_list = div().flex().flex_col().gap_2();
+            if detail.transcripts.is_empty() {
+                transcript_list = transcript_list.child(
+                    div()
+                        .text_color(rgb(0x9a9ba0))
+                        .text_size(px(13.0))
+                        .child("まだ文字起こしがありません。「+ 新規アップロード」から始めてください。"),
+                );
+            }
+            for t in &detail.transcripts {
+                let media_id = t.media_id.clone();
+                let project_id_for_open = detail.project_id.clone();
+                let weak_open = weak.clone();
+                let filename = Path::new(&t.media_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| t.media_path.clone());
+                transcript_list = transcript_list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .px_2()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(rgb(0x2a2a2a))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(div().text_size(px(14.0)).child(filename))
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(0x9a9ba0))
+                                        .child(format!("{}件", t.segment_count)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id(format!("open-transcript-{media_id}"))
+                                .flex_none()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x3d3e42))
+                                .cursor_pointer()
+                                .child("開く")
+                                .on_click(move |_event, _window, cx| {
+                                    if let Some(strong) = weak_open.upgrade() {
+                                        let (project_id, media_id) = (project_id_for_open.clone(), media_id.clone());
+                                        strong.update(cx, |this, cx| this.open_media(project_id, media_id, cx));
+                                    }
+                                }),
+                        ),
+                );
+            }
+
+            let project_id_for_upload = detail.project_id.clone();
+            let mut root = div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .p_4()
+                .bg(rgb(0x1e1e1e))
+                .text_color(rgb(0xdddddd))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(div().text_size(px(18.0)).child(detail.project_name.clone()))
+                        .child(
+                            div()
+                                .id("back-to-projects-from-detail")
+                                .text_size(px(12.0))
+                                .text_color(rgb(0x9a9ba0))
+                                .cursor_pointer()
+                                .child("← プロジェクト一覧")
+                                .on_click({
+                                    let weak = weak.clone();
+                                    move |_event, _window, cx| {
+                                        if let Some(strong) = weak.upgrade() {
+                                            strong.update(cx, |this, cx| this.back_to_projects(cx));
+                                        }
+                                    }
+                                }),
+                        ),
+                )
+                .child(terms_panel)
+                .child(
+                    div()
+                        .id("new-upload")
+                        .flex_none()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgb(0x5b9cf6))
+                        .text_color(rgb(0x0a0a0a))
+                        .cursor_pointer()
+                        .child("+ 新規アップロード")
+                        .on_click({
+                            let weak = weak.clone();
+                            move |_event, _window, cx| {
+                                if let Some(strong) = weak.upgrade() {
+                                    let project_id = project_id_for_upload.clone();
+                                    strong.update(cx, |this, cx| this.open_upload(project_id, cx));
+                                }
+                            }
+                        }),
+                );
+            if let Some(error) = &detail.error {
+                root = root.child(div().text_color(rgb(0xff8888)).text_size(px(12.0)).child(error.clone()));
+            }
+            return root
+                .child(div().id("transcripts-list").flex_1().min_h(px(0.0)).overflow_y_scroll().child(transcript_list))
                 .into_any_element();
         }
 
@@ -2409,6 +3940,7 @@ impl Render for AppRoot {
         };
 
         let is_running = matches!(upload.status, UploadStatus::Running(_));
+        let project_id_for_back = upload.project_id.clone();
 
         div()
             .size_full()
@@ -2426,7 +3958,7 @@ impl Render for AppRoot {
                     .text_size(px(12.0))
                     .text_color(if is_running { rgb(0x555555) } else { rgb(0x9a9ba0) })
                     .when(!is_running, |el| el.cursor_pointer())
-                    .child("← プロジェクト一覧に戻る")
+                    .child("← プロジェクトに戻る")
                     .on_click({
                         let weak = weak.clone();
                         move |_event, _window, cx| {
@@ -2442,7 +3974,8 @@ impl Render for AppRoot {
                                 return;
                             }
                             if let Some(strong) = weak.upgrade() {
-                                strong.update(cx, |this, cx| this.back_to_projects(cx));
+                                let project_id = project_id_for_back.clone();
+                                strong.update(cx, |this, cx| this.back_to_project_detail(project_id, cx));
                             }
                         }
                     }),
@@ -2528,7 +4061,52 @@ fn main() -> anyhow::Result<()> {
             KeyBinding::new("cmd-alt-right", SeekForward, None),
             KeyBinding::new("cmd-[", RateDown, None),
             KeyBinding::new("cmd-]", RateUp, None),
+            // Loop playback (see docs/plan.md's "(4) ループ再生UI" section).
+            // `i`/`o` (in-point/out-point) rather than `[`/`]`: on macOS,
+            // `cmd-shift-[`/`cmd-shift-]` are the systemwide "previous/next
+            // tab" shortcut in most Cocoa apps (Safari, Terminal, etc.) --
+            // confirmed via real-machine testing that the bracket bindings
+            // silently never reached this app at all (no visible effect),
+            // consistent with the OS/window-chrome intercepting them before
+            // GPUI's key handling ever sees the event. `i`/`o` also matches
+            // the in/out-point convention from video/audio editors (Premiere,
+            // Final Cut, QuickTime Player), so it reads naturally too.
+            KeyBinding::new("cmd-shift-i", SetLoopStart, None),
+            KeyBinding::new("cmd-shift-o", SetLoopEnd, None),
+            KeyBinding::new("cmd-shift-l", ToggleLoop, None),
+            // `cmd-z`/`cmd-shift-z` are already `Textarea`/`Input`'s own
+            // internal (keystroke-level) undo/redo, scoped to their
+            // `"Input"` key context (`gpui-base-0.6.0/src/input/base/state.rs`).
+            // A plain `None`-scoped binding here would win over that scoped
+            // one whenever a Textarea is focused (this app's own global
+            // binds always do -- see the `Cmd+Option+←/→` collision note
+            // above), silently taking over character-level undo while
+            // editing. Scoping ours to `"!Input"` instead makes it apply
+            // only when nothing --or nothing text-editable-- is focused,
+            // letting Textarea's own undo/redo through untouched.
+            KeyBinding::new("cmd-z", SegmentUndo, Some("!Input")),
+            KeyBinding::new("cmd-shift-z", SegmentRedo, Some("!Input")),
+            // `escape` while a Textarea/Input *is* focused is already
+            // bound by `gpui-base` itself (`Some("Input")`) -- that
+            // handler propagates once it's done with its own concerns, and
+            // the root div's `.on_action::<Escape>()` picks up the bubble,
+            // so no binding is needed for that path. This one covers the
+            // opposite case: nothing focused, but a picker still open --
+            // same `"!Input"` pattern as `Cmd+Z` above, for the same
+            // reason (a plain `None` binding would shadow the input's own
+            // scoped one whenever something *is* focused).
+            KeyBinding::new("escape", LeaveEdit, Some("!Input")),
         ]);
+        // Quit when the last window closes -- GPUI's default (like a bare
+        // Cocoa app with no `applicationShouldTerminateAfterLastWindowClosed`
+        // override) is to keep the process running with no window and no
+        // way to bring one back, which isn't what a normal desktop app does.
+        cx.on_window_closed(|cx, _window_id| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), move |window, cx| {
                 let conn = open_app_db().expect("opening app database");
@@ -2546,7 +4124,7 @@ fn main() -> anyhow::Result<()> {
                             serde_json::from_str(&json).expect("parsing transcript json");
                         let transport = Arc::new(Transport::new(media_path).expect("opening media_path"));
                         // This path deliberately never touches the DB (see
-                        // `EditorLayoutDemo::media_id`'s doc comment) --
+                        // `EditorScreen::media_id`'s doc comment) --
                         // `project`'s own connection is opened but unused.
                         let project = ProjectContext {
                             conn: open_app_db().expect("opening app database"),
@@ -2555,17 +4133,34 @@ fn main() -> anyhow::Result<()> {
                             speaker_db_ids: HashMap::new(),
                             speaker_names: HashMap::new(),
                         };
-                        let editor = build_editor_entity(segments, transport, project, cx);
+                        let editor = build_editor_entity(segments, transport, media_path.clone(), project, cx);
                         AppScreen::Editor(editor)
                     }
                     _ => {
                         let projects =
                             asr_core::store::projects::list_projects(&conn).expect("listing past projects");
-                        AppScreen::Projects(ProjectsScreen { projects, error: None })
+                        AppScreen::Projects(ProjectsScreen { projects, error: None, new_project_name: None })
                     }
                 };
-                let view = cx.new(|_cx| AppRoot { screen, conn });
-                cx.new(|cx| Root::new(view, window, cx))
+                let root = cx.new(|cx| {
+                    // Periodic autosave for `ProjectDetail`'s term dictionary
+                    // -- same "dirty flag + timer" pattern as
+                    // `EditorScreen`'s own autosave (see `build_editor_entity`),
+                    // just at the `AppRoot` level since `ProjectDetailScreen`
+                    // is a plain field here, not its own `Entity`.
+                    cx.spawn(async move |this, cx| loop {
+                        cx.background_executor().timer(Duration::from_millis(2000)).await;
+                        let alive = this.update(cx, |view: &mut AppRoot, cx| {
+                            view.persist_project_detail(cx);
+                        });
+                        if alive.is_err() {
+                            break;
+                        }
+                    })
+                    .detach();
+                    AppRoot { screen, conn }
+                });
+                cx.new(|cx| Root::new(root, window, cx))
             })
             .expect("failed to open window");
         })

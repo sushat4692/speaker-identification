@@ -3,10 +3,13 @@
 //! validated by ear in `bin/playback_spike.rs`'s `play_signalsmith` path
 //! (see docs/plan.md "3b. 再生エンジンスパイク"). This is that spike
 //! generalized into something a UI can hold onto and drive interactively
-//! (play/pause/seek/rate) instead of a fire-and-forget CLI run.
+//! (play/pause/seek/rate/loop) instead of a fire-and-forget CLI run.
 //!
-//! Looping and click-to-seek-from-a-timeline are deliberately out of scope
-//! here — see the plan's playback-integration section for what's deferred.
+//! Click-to-seek-from-a-timeline is handled entirely in `apps/desktop`
+//! (`seek`); loop playback (`set_loop_region`) below ports the spike's
+//! `play_signalsmith` wrap-in-place algorithm (fill the whole output buffer
+//! across a wrap within one callback, `reset()` on wrap to avoid a seam) --
+//! see that function's doc comment for the original validation.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -16,7 +19,7 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use signalsmith_stretch::Stretch;
 
-use crate::PlaybackRate;
+use crate::{LoopRegion, PlaybackRate};
 
 /// State shared between the UI thread (this struct's methods) and cpal's
 /// realtime audio callback thread. Every field here must tolerate being read
@@ -35,6 +38,10 @@ struct Shared {
     /// `f32` bits (`to_bits`/`from_bits`) — no `AtomicF32` in `std`.
     rate_bits: AtomicU32,
     stretch: Mutex<Stretch>,
+    /// Active loop region, if any -- checked (and wrapped on) every audio
+    /// callback in `render`. `None` means "play straight through to the end
+    /// of the track", the pre-existing behavior.
+    loop_region: Mutex<Option<LoopRegion>>,
 }
 
 /// Owns realtime playback of one decoded audio file. Dropping this stops
@@ -76,6 +83,7 @@ impl Transport {
             playing: AtomicBool::new(false),
             rate_bits: AtomicU32::new(1.0f32.to_bits()),
             stretch: Mutex::new(Stretch::preset_default(channels as u32, sample_rate)),
+            loop_region: Mutex::new(None),
         });
 
         let cb_shared = shared.clone();
@@ -95,6 +103,13 @@ impl Transport {
     /// The audio callback body, split out so it doesn't need to be read
     /// inline with the `build_output_stream` closure noise. Runs on cpal's
     /// realtime thread — see the `Shared` doc comment on what that implies.
+    ///
+    /// Ports `bin/playback_spike.rs`'s `play_signalsmith` loop-wrap
+    /// algorithm: fill the whole output buffer in a `while` loop rather
+    /// than one bounded copy, so a wrap lands *within* the same callback
+    /// (no one-callback silence gap at the seam) -- validated by ear there
+    /// before being generalized here. With no loop region set, the `while`
+    /// body degenerates to the original single-copy-then-stop behavior.
     fn render(shared: &Shared, output: &mut [f32]) {
         let channels = shared.channels;
         if !shared.playing.load(Ordering::Relaxed) {
@@ -116,20 +131,52 @@ impl Transport {
         let rate = f32::from_bits(shared.rate_bits.load(Ordering::Relaxed)).max(0.01) as f64;
         let input_frames_needed = ((output_frames as f64) * rate).round().max(1.0) as usize;
 
-        // Zero-initialized so the tail past end-of-track feeds `process()`
-        // silence rather than reading past the buffer.
+        // Loop bounds in frames, if a region is active -- recomputed every
+        // callback (cheap) rather than cached, since the region can change
+        // between callbacks via `set_loop_region`.
+        let loop_bounds = shared.loop_region.lock().unwrap().map(|region| {
+            let to_frame = |ms: u64| ((ms as f64 / 1000.0) * shared.sample_rate as f64).round() as usize;
+            (to_frame(region.start_ms).min(shared.total_frames), to_frame(region.end_ms).min(shared.total_frames))
+        });
+
+        // Zero-initialized so a tail past end-of-track (no loop active)
+        // feeds `process()` silence rather than reading past the buffer.
         let mut input_buf = vec![0.0f32; input_frames_needed * channels];
-        let take = (shared.total_frames - pos).min(input_frames_needed);
-        let src_start = pos * channels;
-        let src_end = src_start + take * channels;
-        input_buf[..take * channels].copy_from_slice(&shared.samples[src_start..src_end]);
-        pos += take;
-        if pos >= shared.total_frames {
+        let mut filled = 0;
+        let mut finished = false;
+
+        while filled < input_frames_needed {
+            // The loop's own end if one is active, else the track's end --
+            // reached `end_bound`, we can't just keep copying (this
+            // callback's turn is done, one way or the other).
+            let end_bound = loop_bounds.map(|(_, end)| end).unwrap_or(shared.total_frames);
+            if pos >= end_bound {
+                match loop_bounds {
+                    Some((start, _)) => {
+                        pos = start;
+                        shared.stretch.lock().unwrap().reset();
+                        continue; // may still have room left in this callback
+                    }
+                    None => {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            let take = (end_bound - pos).min(input_frames_needed - filled);
+            let src_start = pos * channels;
+            let src_end = src_start + take * channels;
+            input_buf[filled * channels..(filled + take) * channels].copy_from_slice(&shared.samples[src_start..src_end]);
+            pos += take;
+            filled += take;
+        }
+
+        shared.position.store(pos, Ordering::Relaxed);
+        if finished {
             shared.playing.store(false, Ordering::Relaxed);
         }
-        shared.position.store(pos, Ordering::Relaxed);
 
-        shared.stretch.lock().unwrap().process(&input_buf, output);
+        shared.stretch.lock().unwrap().process(&input_buf[..filled * channels], output);
     }
 
     pub fn play(&self) {
@@ -221,5 +268,104 @@ impl Transport {
 
     pub fn duration_ms(&self) -> u64 {
         self.shared.duration_ms
+    }
+
+    /// Sets (or clears, with `None`) the active loop region -- takes effect
+    /// on the very next audio callback (`render`). Does not itself seek or
+    /// change play/pause state; the caller decides whether entering a loop
+    /// should also jump the playhead into it.
+    pub fn set_loop_region(&self, region: Option<LoopRegion>) {
+        *self.shared.loop_region.lock().unwrap() = region;
+    }
+
+    pub fn loop_region(&self) -> Option<LoopRegion> {
+        *self.shared.loop_region.lock().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a `Shared` directly (bypassing `Transport::new`'s cpal device
+    /// open, so this runs headless in CI) with silent samples -- `render`'s
+    /// looping logic only cares about frame-index bookkeeping, not the
+    /// actual sample values. `sample_rate = 1000` makes 1 frame = 1ms, so
+    /// test math can work directly in frames.
+    fn make_shared(total_frames: usize) -> Shared {
+        let channels = 1;
+        let sample_rate = 1000;
+        Shared {
+            samples: vec![0.0f32; total_frames * channels],
+            channels,
+            sample_rate,
+            total_frames,
+            duration_ms: (total_frames as f64 / sample_rate as f64 * 1000.0) as u64,
+            position: AtomicUsize::new(0),
+            playing: AtomicBool::new(true),
+            rate_bits: AtomicU32::new(1.0f32.to_bits()),
+            stretch: Mutex::new(Stretch::preset_default(channels as u32, sample_rate)),
+            loop_region: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn loop_region_wraps_position_within_one_callback() {
+        let shared = make_shared(2000);
+        *shared.loop_region.lock().unwrap() = Some(LoopRegion { start_ms: 500, end_ms: 600 });
+        shared.position.store(590, Ordering::Relaxed);
+
+        // 20 output frames at rate 1.0 needs 20 input frames -- starting at
+        // 590, this must cross the loop's end (600) and wrap to its start
+        // (500), landing at 510 (10 frames before the wrap + 10 after).
+        let mut output = vec![0.0f32; 20];
+        Transport::render(&shared, &mut output);
+
+        assert_eq!(shared.position.load(Ordering::Relaxed), 510);
+        assert!(shared.playing.load(Ordering::Relaxed), "a loop wrap must not stop playback");
+    }
+
+    #[test]
+    fn loop_region_can_wrap_more_than_once_in_a_single_callback() {
+        let shared = make_shared(2000);
+        // A loop shorter than one callback's worth of frames -- forces
+        // multiple wraps within `render`'s single `while` loop.
+        *shared.loop_region.lock().unwrap() = Some(LoopRegion { start_ms: 500, end_ms: 505 });
+        shared.position.store(500, Ordering::Relaxed);
+
+        let mut output = vec![0.0f32; 12]; // 12 input frames needed, loop is only 5 long
+        Transport::render(&shared, &mut output);
+
+        // 12 frames through a 5-frame loop starting at 500: 500->505 (wrap),
+        // 500->505 (wrap), 500->502 -- ends at 502.
+        assert_eq!(shared.position.load(Ordering::Relaxed), 502);
+        assert!(shared.playing.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn no_loop_region_still_stops_at_track_end() {
+        let shared = make_shared(100);
+        shared.position.store(95, Ordering::Relaxed);
+
+        let mut output = vec![0.0f32; 20]; // more than the 5 frames remaining
+        Transport::render(&shared, &mut output);
+
+        assert_eq!(shared.position.load(Ordering::Relaxed), 100);
+        assert!(!shared.playing.load(Ordering::Relaxed), "running off the end with no loop must stop playback");
+    }
+
+    #[test]
+    fn loop_region_past_current_position_plays_through_normally_first() {
+        let shared = make_shared(2000);
+        // Loop set ahead of the current position -- playback should reach
+        // it normally, not jump forward.
+        *shared.loop_region.lock().unwrap() = Some(LoopRegion { start_ms: 500, end_ms: 600 });
+        shared.position.store(0, Ordering::Relaxed);
+
+        let mut output = vec![0.0f32; 50];
+        Transport::render(&shared, &mut output);
+
+        assert_eq!(shared.position.load(Ordering::Relaxed), 50);
+        assert!(shared.playing.load(Ordering::Relaxed));
     }
 }

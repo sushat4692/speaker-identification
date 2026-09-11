@@ -10,6 +10,7 @@ pub mod asr;
 pub mod audio;
 pub mod diarize;
 pub mod error;
+pub mod export;
 pub mod pipeline;
 pub mod speaker;
 pub mod store;

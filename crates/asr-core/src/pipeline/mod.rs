@@ -51,7 +51,7 @@ pub enum PipelineStage {
     Correcting,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TranscriptSegment {
     pub speaker: i32,
     pub start_ms: u64,
