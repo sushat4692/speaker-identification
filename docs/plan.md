@@ -918,6 +918,186 @@ ElevenLabsのプラン別STT同時実行数・日本語での埋め込みモデ�
 
 ---
 
-## 保留：UIの刷新
+## 今回の対応範囲：UIの刷新（デザインシステム基盤 ＋ Settings画面での検証）
 
-ユーザー確認済みの方針（テーマ/部品ライブラリの本格採用・アイコン導入・Settings画面から段階展開）だが、**セグメントリストのスクロール性能問題を先に片付けるべき**との判断で保留。詳細は[UI_POLISH.md](../UI_POLISH.md)参照。
+`UI_POLISH.md`から復帰。他の優先タスク（スクロール性能・話者分離の探索モード配線）が片付いたため着手する。方針・調査結果は[UI_POLISH.md](../UI_POLISH.md)の記載通り（テーマ／部品ライブラリの本格採用、アイコン導入、今回はSettings画面のみで検証）——以下、当時「実装時に確認する」としていた2点を先に確認済みなので、その内容を反映して更新する。
+
+### 確認済み（今回のPlanフェーズで検証）
+
+1. **`AppScreen::Settings`の現在地**: `apps/desktop/src/bin/app.rs:3727-3808`（`if let AppScreen::Settings { api_key_input, error, .. } = &self.screen { ... }`）。構造はUI_POLISH.md執筆時と同一（行番号のみズレていた）。
+2. **テーマのアクセントカラー上書き方法を確定**（`gpui-component-0.6.0/src/theme/`を直接読んで確認）:
+   - `Theme::global_mut(cx) -> &mut Theme`（`theme/mod.rs:184`）で書き換え、`Theme::sync_base(cx)`（`theme/mod.rs:321`、doc comment: 「`Theme::global_mut`経由で書き換えた後に呼ぶこと。素のフィールド書き換えは`Base`レイヤー——`gpui-component`を介さず描画されるスクロールバー等——には反映されないため」）で確定。
+   - `Button::primary()`の見た目は`primary*`ではなく`button_primary*`系トークン（`theme_color.rs:95-101`: `button_primary`/`button_primary_hover`/`button_primary_active`/`button_primary_foreground`）を読んでいる——**両方**（`primary*`と`button_primary*`）を同じ値に揃えて書き換える必要がある（`sync_base`は`Theme::global(cx)`の対応する時点の値をそのままコピーするだけなので、書き忘れたフィールドは無視されるだけで警告等は出ない——実装時に取りこぼしが無いよう注意）。
+   - `Hsla::parse_hex("#5b9cf6")`（`Colorize`トレート、`theme/color.rs:60,139,290`、`impl Colorize for Hsla`）で既存の16進値からそのまま変換でき、自分でRGB→HSL変換をする必要はない。`.lighten(factor)`/`.darken(factor)`（同トレート`:36,40`）でhover/active用のバリエーションを作れる。
+   - 具体的なコード（`main()`、`gpui_kit::init(cx)`の直後）:
+     ```rust
+     use gpui_kit::component::{Colorize as _, Theme};
+
+     let accent = Hsla::parse_hex("#5b9cf6").expect("valid hex");
+     let accent_hover = accent.lighten(0.08);
+     let accent_active = accent.darken(0.08);
+     let on_accent = Hsla::parse_hex("#0a0a0a").expect("valid hex"); // 既存のアクセント上文字色と合わせる
+     {
+         let theme = Theme::global_mut(cx);
+         theme.primary = accent;
+         theme.primary_hover = accent_hover;
+         theme.primary_active = accent_active;
+         theme.primary_foreground = on_accent;
+         theme.accent = accent;
+         theme.accent_foreground = on_accent;
+         theme.ring = accent;
+         theme.button_primary = accent;
+         theme.button_primary_hover = accent_hover;
+         theme.button_primary_active = accent_active;
+         theme.button_primary_foreground = on_accent;
+     }
+     Theme::sync_base(cx);
+     ```
+   - `Button`（`gpui_kit::component::button::{Button, ButtonVariants as _}`）・`GroupBox`（`gpui_kit::component::group_box::GroupBox`、`GroupBox::new().title(...)`）・`Alert`（`gpui_kit::component::alert::Alert`、`Alert::error(id, message)`）とも実際にコンストラクタ・ビルダーメソッドの存在をソースで確認済み。
+
+### 設計（Phase A: 基盤）
+
+1. `apps/desktop/src/bin/app.rs`の`main()`: `gpui_kit::application()`に`.with_assets(gpui_kit::assets::Assets)`を追加。
+2. 上記で確定したアクセントカラー上書きコードを`gpui_kit::init(cx)`の直後に追加。ダークモード固定は現状維持。
+3. `speaker_color()`（`speaker_timeline.rs`）のテーマ連携は保留（UI_POLISH.md記載通り、Editor画面刷新時に判断）。
+
+### 設計（Phase B: Settings画面、今回の検証対象）
+
+対象: `apps/desktop/src/bin/app.rs:3727-3808`。UI_POLISH.mdの設計通り——外枠を`GroupBox`または`.popover_style(cx)`、タイトル/ステータス行をテーマの文字色・サイズトークンに、APIキー入力欄の囲みをテーマトークンに、エラー表示を`Alert::error(...)`に、「戻る」「保存」ボタンを`Button::new(...).outline()`/`Button::new(...).primary().icon(IconName::Check)`に置き換え。クリックハンドラのロジック（`cancel_settings`/`save_settings`）自体は変更しない。タイトル横に`IconName::Settings`。
+
+**対象外（今回は見送り、UI_POLISH.md記載通り）**: 他4画面（Projects/ProjectDetail/Upload/Editor）への展開、`player_button`等ローカルクロージャの統合、ホバー/アクティブスタイルの他画面への追加、ライト/ダーク自動追従。
+
+### 検証方法
+
+1. `cd apps/desktop && cargo +nightly build --bin app` / `clippy --bin app --all-targets`——警告・エラーゼロ。
+2. 起動スモークテスト（引数無し→プロジェクト一覧→「設定」リンクからSettings画面を開く）でクラッシュ無し確認。
+3. **実機での見た目確認（ユーザー、必須）**——(1) 全体の配色・余白がテーマに乗って統一感が出ているか (2) 戻る/保存ボタンがコンポーネントとして自然に見えるか、クリック・ホバー時の反応があるか (3) エラー時の`Alert`表示が分かりやすいか (4) アクセントカラーが従来の青の印象を保っているか (5) この画面の方向性で残り4画面へ展開してよいか、それとも別の調整が要るか。
+
+実装・確認が完了したら`UI_POLISH.md`のこのセクションは削除し（`docs/plan.md`側が最新の実装状況を持つ）、残る「対象外」項目（他4画面の展開）だけを`UI_POLISH.md`に残す。
+
+**実装状況**: 実装済み。
+
+- `main()`: `gpui_kit::application()`に`.with_assets(gpui_kit::assets::Assets)`を追加。`gpui_kit::init(cx)`の直後で、`Hsla::parse_hex("#5b9cf6")`＋`Colorize::lighten/darken`で作ったhover/active込みのアクセント一式を`Theme::global_mut(cx)`の`primary*`系4フィールドと`button_primary*`系4フィールドの両方に設定（`Button::primary()`は後者しか見ないという既知の落とし穴を実装前に確認済みだった通り）、`Theme::sync_base(cx)`で確定。
+- `AppScreen::Settings`の描画（`apps/desktop/src/bin/app.rs`）を全面書き換え: 外枠は`GroupBox::new().outline()`（`GroupBoxVariant::Normal`は背景・枠線・パディングを一切持たないと判明したため、`.outline()`バリアントを採用）、タイトルに`Icon::new(IconName::Settings)`、ステータス文字色・入力欄の枠線/背景を`cx.theme().muted_foreground`/`cx.theme().input`/`cx.theme().input_background()`に、エラー表示を`Alert::error(...)`に、「戻る」「保存」ボタンを`Button::new(...).outline()`/`Button::new(...).primary().icon(IconName::Check)`に置き換え。クリックハンドラのロジック（`cancel_settings`/`save_settings`）は無変更。
+- 新規importが必要だった箇所: `gpui_kit::component::{alert::Alert, button::{Button, ButtonVariants as _}, group_box::{GroupBox, GroupBoxVariants as _}, ActiveTheme as _, Colorize as _, Icon, IconName}`。
+
+`cd apps/desktop && cargo +nightly build --all-targets`/`clippy --all-targets`、`cargo build --workspace`/`clippy --workspace --all-targets`とも警告・エラーゼロ。起動スモークテストでクラッシュ無し確認済み。
+
+**確認済み**: ユーザーが実機で確認し「良い感じだと思います」と確認済み。残り4画面への展開もこの方向性でOKとのこと（後続セクション参照）。
+
+---
+
+## 今回の対応範囲：UIの刷新（Projects / ProjectDetail / Upload の3画面）
+
+### Context
+
+Settings画面での検証が完了し、ユーザーから「他ページにも反映していってほしい」との指示、あわせて3つのルールが明示された:
+
+1. 同じスタイルの場合は同じコンポーネントを使う。
+2. 同じ目的を持つ機能は同じスタイル・同じレイアウトルールにする（例: 戻るナビゲーション、送信・キャンセルボタン）。
+3. 1カラムに固執せず、2〜3カラムなども利用する。
+
+今回は`Projects`・`ProjectDetail`・`Upload`の3画面を対象にする。**`Editor`画面は対象外**——このアプリで最も複雑・最も行数が多い画面（`speaker_timeline`のcanvas描画、`gpui::list`の仮想化、ドラッグ操作、`player_button`/`zoom_button`/`loop_button`等の既存ローカルクロージャ、話者バッジの`style_speaker_pill`等）で、他画面より一段階リスクが高いため、この3画面での適用結果を見てから別途着手する（`UI_POLISH.md`に残る「対象外」項目として整理済み）。
+
+### 現状把握（直接コード確認）
+
+- **Projects**（`apps/desktop/src/bin/app.rs:3822-3952`）: ヘッダー（タイトル＋「設定 (APIキー)」リンク）／新規作成フォーム（`Input`＋手書きCTA）／エラー表示（生テキスト）／プロジェクト一覧（手書きの行×N、「開く」も手書きボタン）。
+- **ProjectDetail**（`apps/desktop/src/bin/app.rs:3954-4248`）: ヘッダー（タイトル＋「← プロジェクト一覧」リンク）／用語辞書パネル（`border_1`の手書きdiv、各行がTextarea×2＋有効/無効リンク＋削除リンク、末尾に追加フォーム）／「+ 新規アップロード」手書きCTA／エラー表示／文字起こし一覧（Projectsと同じ手書き行パターン）。**現状、用語辞書パネルと文字起こし一覧が縦に2段重ね——両方ともスクロール領域を持つ`flex_1`で、画面の使い方として窮屈**（2〜3カラム化の分かりやすい対象）。
+- **Upload**（`apps/desktop/src/bin/app.rs:4250-4442`）: 中央寄せの単一カラムに、タイトル／「← プロジェクトに戻る」リンク／ファイル選択ボタン／事前分析スキップの`Checkbox`（既存でコンポーネント化済み）／探索モードのプレビュー（スライダー＋タイムラインプレビュー、`ExploreState`ごとに分岐）／「処理を開始」手書きCTA／パイプライン進捗（`Progress`、既存でコンポーネント化済み）。**「操作（ファイル選択・スキップ・開始）」と「情報（探索プレビュー・進捗）」が同じ縦一列に混在——役割の異なる2つを左右に分けられる**。
+
+### 設計
+
+**共有ヘルパー（新規、`apps/desktop/src/bin/app.rs`、`style_speaker_pill`の近くに追加）**——ルール1・2をコードレベルで担保する:
+
+```rust
+/// 「戻る」系のナビゲーションリンクの唯一の見た目定義。ProjectDetail・
+/// Upload・(将来)Editorのヘッダーが全てこれを通ることで、同じ目的の機能は
+/// 同じスタイル・同じレイアウトになる（ユーザー指示のルール2）。
+fn back_nav_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    Button::new(id).ghost().icon(IconName::ChevronLeft).label(label)
+}
+
+/// 全画面共通のヘッダー行の唯一のレイアウト定義——左に「戻る」ボタン
+/// （無ければ無し）＋タイトル、右にその画面固有のアクション（無ければ
+/// 空）。ユーザー指示：「ヘッダーは共通レイアウトにして、戻るリンク有り
+/// 無し・右側にページ特有のメニュー有り無しを想定しておく」に対応。
+/// `back`は`back_nav_button(...)`の戻り値をそのまま渡す想定（`Button`は
+/// `IntoElement`なので`Option<Button>`のまま`.children(...)`に渡せる）。
+///
+/// 副次的な効果として、ProjectDetailの「← プロジェクト一覧」が今まで
+/// ヘッダー右側にあった（Editor画面の「← プロジェクトに戻る」は左側、と
+/// 画面間で位置が食い違っていた）のを、Editorに合わせて左側に統一する
+/// ——ルール2の「同じ目的の機能は同じレイアウトルールに」を満たすための
+/// 意図的な位置変更。
+fn screen_header(
+    back: Option<Button>,
+    title: impl IntoElement,
+    actions: Vec<AnyElement>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .child(div().flex().items_center().gap_2().children(back).child(div().text_size(px(18.0)).child(title)))
+        .child(div().flex().items_center().gap_2().children(actions))
+}
+
+/// シンプルな（仮想化していない）一覧行の唯一の見た目定義——プロジェクト
+/// 一覧・文字起こし一覧が同じ行スタイルになる。
+fn list_row(border_color: Hsla) -> Div {
+    div().flex().items_center().justify_between().gap_4().px_2().py_2().border_b_1().border_color(border_color)
+}
+```
+
+送信・キャンセルボタンの組は専用ヘルパーを作らず、`Button::new(id).primary().label(...)` / `Button::new(id).outline().label(...)`を**常にこの2バリアントの組み合わせだけ**で書く、という規約に統一する（Settings画面の「保存」/「戻る」で確立済みのパターンをそのまま踏襲）。
+
+**Settings画面（前回実装済みだが、`screen_header`に合わせて追従）**: 前回作った独自のタイトル行（`Icon::new(IconName::Settings)`＋「APIキー設定」）を`screen_header(None, タイトル要素, vec![])`経由に置き換える——ルール1（同じスタイルは同じコンポーネント）を徹底し、`screen_header`誕生前に書いた箇所が浮かないようにする。戻る導線はここには元々無い（画面下部の「戻る」ボタンは`return_to`に戻るキャンセル操作であり、ヘッダーのナビゲーションとは別物）ので`back`は`None`のまま。**あわせて、画面下部の「戻る」ボタンのラベルを「キャンセル」に変更**（`cancel_settings`メソッド名・ロジックは変更しない、`Button::new("settings-cancel").outline().label("キャンセル")`とラベルのみ変更）——ヘッダーの「戻る」ナビゲーションと紛らわしいため、ユーザー指示により区別する。
+
+**Projects画面**:
+- ヘッダー: `screen_header(None, "プロジェクト", vec![Button::new("open-settings-from-projects").ghost().icon(IconName::Settings).label("設定 (APIキー)").into_any_element()])`——戻る無し（最上位画面）、右に設定リンク。
+- 新規作成フォームの「新規作成」ボタン: `Button::new("new-project").primary().label("新規作成")`。
+- エラー表示: `Alert::error("projects-error", message)`。
+- 各プロジェクト行: `list_row(cx.theme().border)`＋中身は現状のまま、「開く」を`Button::new(...).outline().label("開く")`に。
+- カラム構成は変更なし（1カラムのリストのまま）——プロジェクト一覧はリスト型の画面としてこれが正しいレイアウトだと判断（無理に2カラム化しない）。
+
+**ProjectDetail画面**（2〜3カラム化の対象）:
+- ヘッダー: `screen_header(Some(back_nav_button("back-to-projects-from-detail", "プロジェクト一覧")), detail.project_name.clone(), vec![])`——戻るを左側に統一（現状は右側にあった）、右側アクションは今回は無し。
+- **用語辞書パネルと文字起こし一覧を横に並べる2カラムレイアウトに変更**——`div().flex().gap_4().flex_1().min_h(px(0.0))`の行の中に、`GroupBox::new().outline().title("用語辞書").flex_1()`（現行の用語辞書パネルの中身をそのまま`.child(...)`）と、`GroupBox::new().outline().title("文字起こし一覧").flex_1()`（文字起こし一覧＋「+ 新規アップロード」ボタン）を左右に並べる。それぞれ内部は`overflow_y_scroll`のまま（縦にはみ出た分は各カラム内でスクロール）。
+- 用語の各行にある「有効/無効」「削除」リンク: `Button::new(id).text().xsmall().label(...)`に統一（同じ画面内の同じ目的＝行内の軽量アクションという性質を揃える）。
+- 「+ 新規アップロード」: `Button::new("new-upload").primary().label("+ 新規アップロード")`（文字起こし一覧パネルの下に配置）。
+- エラー表示: `Alert::error("project-detail-error", message)`。
+- 文字起こし一覧の各行: `list_row(cx.theme().border)`＋「開く」を`Button::new(...).outline().label("開く")`に。
+
+**Upload画面**（2カラム化の対象）:
+- ヘッダー: `screen_header(Some(back_nav_button("back-to-projects", "プロジェクトに戻る").disabled(is_running)), "音声/動画を文字起こし", vec![])`——現状はタイトルと戻るリンクが縦に別々の中央寄せ行だったのを、他画面と同じ横並びヘッダー行に統一。「実行中は無効化」ロジックは`Button`の`.disabled(is_running)`にそのまま置き換える。
+- **ヘッダーの下を左右2カラムに分割**——左（操作系、幅固定`px(360.0)`程度）: ファイル選択ボタン（`Button::new("pick-media").outline().label(...)`、選択済みファイル名は`Button`の子要素として添える）・事前分析スキップの`Checkbox`（既存のまま）・「処理を開始」ボタン（`Button::new("start-pipeline").primary().label("処理を開始").loading(is_running).disabled(is_running)`）・パイプライン進捗（既存の`Progress`、失敗時は`Alert::error`に）。右（情報系、`explore_area`、既存の`EXPLORE_PREVIEW_WIDTH`をそのまま踏襲）: 探索プレビュー（スライダー＋タイムライン）。ファイルが未選択でまだ何も無い間は右カラムが空（現状の`ExploreState::Idle`の空divのまま、無理に隠さない——実装をシンプルに保つ）。
+- 探索失敗時のエラー: `Alert::error(...)`。
+
+**変更しないもの**: 各ボタンの`on_click`ハンドラの中身（既存メソッド呼び出し）、`Checkbox`/`Slider`/`Progress`（既にコンポーネント化済みでそのまま）、`ExploreState`の状態遷移ロジック、探索モード・パイプラインの動作そのもの。
+
+### 対象外（今回は見送り）
+
+- `Editor`画面（`UI_POLISH.md`に記載の通り、次回に着手）。
+- `speaker_color()`のテーマ連携（Editor画面刷新時に判断）。
+- Projects画面の一覧をカード形式のグリッドにする案——単純な開くだけのリストとしては現状の1カラムリストの方が適切と判断し見送り。
+
+### 検証方法
+
+1. `cd apps/desktop && cargo +nightly build --bin app` / `clippy --bin app --all-targets`——警告・エラーゼロ。
+2. 起動スモークテスト（引数無し→プロジェクト一覧→新規作成→詳細画面→新規アップロード画面、の一通りの画面遷移）でクラッシュ無し確認。
+3. **実機での見た目・操作確認（ユーザー、必須）**——(1) 3画面とも配色・ボタンの見た目に統一感が出ているか (2) ProjectDetailの用語辞書／文字起こし一覧が左右2カラムで見やすいか (3) Uploadの操作系／情報系の左右分割が自然か (4) 戻るリンク・送信系ボタンが画面をまたいで同じ見た目・同じ位置関係になっているか (5) 既存の操作（プロジェクト作成・用語追加/削除/有効無効・文字起こし一覧を開く・ファイル選択・事前分析スキップ・処理開始）が全て今まで通り動くか。
+
+**実装状況**: 実装済み。
+
+- 共有ヘルパー3点を新設（`style_speaker_pill`の近く）: `back_nav_button`（戻るボタンの唯一の見た目）、`screen_header`（戻る・タイトル・右側アクションの唯一のヘッダーレイアウト）、`list_row`（一覧行の唯一の見た目）。
+- **Settings画面**: 独自だったタイトル行を`screen_header(None, ...)`経由に変更。下部の「戻る」ボタンは「キャンセル」にラベル変更（ヘッダーの「戻る」ナビゲーションと紛らわしいため）。
+- **Projects画面**: `screen_header(None, "プロジェクト", vec![設定リンク])`、`Button::primary()`（新規作成）、`Alert::error`、`list_row`＋`Button::outline()`（開く）。
+- **ProjectDetail画面**: `screen_header(Some(back_nav_button(...)), プロジェクト名, vec![])`——戻るボタンをヘッダー右側から左側に移動（Editor画面の既存配置と統一）。**用語辞書パネルと文字起こし一覧を左右2カラム**に変更（各`GroupBox::new().outline().title(...)`）。用語行の「有効/無効」「削除」を`Button::new(...).text().xsmall()`に統一。「+ 新規アップロード」は`Button::primary()`で文字起こし一覧カラムの下に配置。
+- **Upload画面**: `screen_header`をヘッダーに採用（従来は縦積みのタイトル+戻るリンクだったのを他画面と同じ横並び行に）。**左（操作系: ファイル選択・スキップ・処理開始・進捗）／右（情報系: 探索プレビュー）の2カラム**に変更。「音声/動画を選ぶ」「処理を開始」を`Button`に、失敗時の表示を`Alert::error`に統一。実行中の戻るボタン無効化は`.disabled(is_running)`（見た目）＋クロージャ内`if is_running { return; }`（実際の防止、`Button`の`disabled`がクリックを内部的に止めるかドキュメントで確認しきれなかったため、既存の防御ロジックをそのまま維持）の二重構成。
+
+`cd apps/desktop && cargo +nightly build --all-targets`/`clippy --all-targets`、`cargo build --workspace`/`clippy --workspace --all-targets`とも警告・エラーゼロ。起動スモークテスト2パターン（引数無し→プロジェクト一覧、開発用ショートカット→Editor画面）でクラッシュ無し確認済み。
+
+**未検証（実機での見た目・操作確認が必須——GUI操作が要るためこちらでは検証できない）**: 上記「検証方法」3.の(1)〜(5)全て。
+
+**バグ修正**: ユーザーから「プロジェクト詳細画面の『プロジェクト一覧』に戻るリンクが機能していないかも」と報告。確認したところ、`ProjectDetail`画面のヘッダーで`back_nav_button("back-to-projects-from-detail", "プロジェクト一覧")`を`screen_header`に渡す際、**`.on_click(...)`を付け忘れていた**（Upload画面の同等のボタンには付いていたが、ProjectDetailの方だけ抜けていた）。`back_to_projects(cx)`を呼ぶクリックハンドラを追加して修正。`cd apps/desktop && cargo +nightly build --all-targets`/`clippy --all-targets`とも警告・エラーゼロ、起動スモークテストでクラッシュ無し確認済み。他の`Button::new(...)`/`back_nav_button(...)`呼び出し箇所（Settings/Projects/ProjectDetail/Upload全て）を再点検し、同様の付け忘れが無いことを確認済み。

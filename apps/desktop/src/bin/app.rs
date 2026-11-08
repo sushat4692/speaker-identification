@@ -23,13 +23,15 @@ use std::time::Duration;
 use asr_audio::{PlaybackRate, Transport};
 use asr_core::pipeline::TranscriptSegment;
 use gpui_kit::base::{Align, ElementExt as _, Placement, Positioner, POPUP_PRIORITY};
+use gpui_kit::component::alert::Alert;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::group_box::{GroupBox, GroupBoxVariants as _};
 use gpui_kit::component::input::{Escape, Input, InputState, Position, RopeExt as _, Textarea, TextareaState};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
-use gpui_kit::component::Root;
-use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::component::{ActiveTheme as _, Colorize as _, Disableable as _, Icon, IconName, Root, Sizable as _};
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _, *};
 
 use desktop::segment_list::format_ms;
@@ -192,6 +194,39 @@ fn style_speaker_pill<E: Styled>(el: E, color: Hsla) -> E {
         .text_size(px(11.0))
         .line_height(Rems(1.0))
         .text_color(color)
+}
+
+/// The only definition of a "back"-style navigation button -- every screen
+/// that can navigate back (`ProjectDetail`, `Upload`, and eventually
+/// `Editor`) goes through this, so the same action always looks and sits
+/// the same way (see docs/plan.md's "UIの刷新" section, rule: 同じ目的の
+/// 機能は同じスタイル・同じレイアウトに).
+fn back_nav_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    Button::new(id).ghost().icon(IconName::ChevronLeft).label(label)
+}
+
+/// The only layout definition for a screen's top header row: an optional
+/// "back" button (from `back_nav_button`) plus title on the left, and a
+/// screen-specific set of actions (may be empty) on the right. Used by
+/// every top-level screen (`Projects`/`ProjectDetail`/`Upload`/`Settings`,
+/// and eventually `Editor`) so "does this screen have a way back, and
+/// where does it sit" is answered identically everywhere, instead of each
+/// screen inventing its own header arrangement.
+fn screen_header(back: Option<Button>, title: impl IntoElement, actions: Vec<AnyElement>) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .child(div().flex().items_center().gap_2().children(back).child(div().text_size(px(18.0)).child(title)))
+        .child(div().flex().items_center().gap_2().children(actions))
+}
+
+/// The only visual definition for a row in one of the app's simple
+/// (non-virtualized) lists -- the project list and the transcript list use
+/// this instead of two near-identical hand-rolled `div()` chains.
+fn list_row(border_color: Hsla) -> Div {
+    div().flex().items_center().justify_between().gap_4().px_2().py_2().border_b_1().border_color(border_color)
 }
 
 /// What happens when a speaker is picked from a `speaker_option_row` --
@@ -3725,83 +3760,93 @@ impl Render for AppRoot {
         let weak = cx.weak_entity();
 
         if let AppScreen::Settings { api_key_input, error, .. } = &self.screen {
+            // First screen migrated to the theme/component system already
+            // bundled with `gpui-component` (see docs/plan.md's "UIの刷新"
+            // section) -- theme tokens (`cx.theme()`) instead of hardcoded
+            // `rgb(0x....)` literals, `GroupBox`/`Button`/`Alert` instead of
+            // hand-rolled styled `div()`s. The rest of the app's screens
+            // still use the old hardcoded-color approach; they migrate the
+            // same way once this one's confirmed to look right.
             let status_text = match load_api_key() {
                 Ok(Some(_)) => "設定済み".to_string(),
                 Ok(None) => "未設定".to_string(),
                 Err(err) => format!("読み取りエラー: {err:#}"),
             };
-            let mut col = div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_4()
-                .bg(rgb(0x1e1e1e))
-                .text_color(rgb(0xdddddd))
-                .child(div().text_size(px(18.0)).child("APIキー設定"))
+            let mut panel = GroupBox::new()
+                .outline()
+                .w(px(360.0))
                 .child(
                     div()
                         .text_size(px(13.0))
-                        .text_color(rgb(0x9a9ba0))
+                        .text_color(cx.theme().muted_foreground)
                         .child(format!("ElevenLabs APIキー: {status_text}")),
                 )
                 .child(
                     div()
-                        .w(px(360.0))
-                        .rounded_md()
+                        .rounded(cx.theme().radius)
                         .border_1()
-                        .border_color(rgb(0x3d3e42))
-                        .bg(rgb(0x2a2b2e))
+                        .border_color(cx.theme().input)
+                        .bg(cx.theme().input_background())
                         .px_2()
                         .py(px(8.0))
                         .child(Input::new(api_key_input).w_full().text_size(px(13.0)).appearance(false)),
                 );
             if let Some(error) = error {
-                col = col.child(div().text_size(px(12.0)).text_color(rgb(0xff8888)).child(error.clone()));
+                panel = panel.child(Alert::error("settings-error", error.clone()));
             }
-            return col
-                .child(
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .p_4()
+                .bg(cx.theme().background)
+                .text_color(cx.theme().foreground)
+                .child(screen_header(
+                    None,
                     div()
                         .flex()
+                        .items_center()
                         .gap_2()
+                        .child(Icon::new(IconName::Settings))
+                        .child("APIキー設定"),
+                    vec![],
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_4()
+                        .child(panel)
                         .child(
                             div()
-                                .id("settings-cancel")
-                                .px_3()
-                                .py_2()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(rgb(0x3d3e42))
-                                .cursor_pointer()
-                                .child("戻る")
-                                .on_click({
+                                .flex()
+                                .gap_2()
+                                .child(Button::new("settings-cancel").outline().label("キャンセル").on_click({
                                     let weak = weak.clone();
                                     move |_event, _window, cx| {
                                         if let Some(strong) = weak.upgrade() {
                                             strong.update(cx, |this, cx| this.cancel_settings(cx));
                                         }
                                     }
-                                }),
-                        )
-                        .child(
-                            div()
-                                .id("settings-save")
-                                .px_3()
-                                .py_2()
-                                .rounded_md()
-                                .bg(rgb(0x5b9cf6))
-                                .text_color(rgb(0x0a0a0a))
-                                .cursor_pointer()
-                                .child("保存")
-                                .on_click({
-                                    let weak = weak.clone();
-                                    move |_event, _window, cx| {
-                                        if let Some(strong) = weak.upgrade() {
-                                            strong.update(cx, |this, cx| this.save_settings(cx));
-                                        }
-                                    }
-                                }),
+                                }))
+                                .child(
+                                    Button::new("settings-save")
+                                        .primary()
+                                        .label("保存")
+                                        .icon(IconName::Check)
+                                        .on_click({
+                                            let weak = weak.clone();
+                                            move |_event, _window, cx| {
+                                                if let Some(strong) = weak.upgrade() {
+                                                    strong.update(cx, |this, cx| this.save_settings(cx));
+                                                }
+                                            }
+                                        }),
+                                ),
                         ),
                 )
                 .into_any_element();
@@ -3821,7 +3866,7 @@ impl Render for AppRoot {
             if projects.projects.is_empty() {
                 list_el = list_el.child(
                     div()
-                        .text_color(rgb(0x9a9ba0))
+                        .text_color(cx.theme().muted_foreground)
                         .text_size(px(13.0))
                         .child("まだプロジェクトがありません。上の欄から新規作成してください。"),
                 );
@@ -3830,45 +3875,29 @@ impl Render for AppRoot {
                 let id = p.id.clone();
                 let weak_open = weak.clone();
                 list_el = list_el.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_4()
-                        .px_2()
-                        .py_1()
-                        .border_b_1()
-                        .border_color(rgb(0x2a2a2a))
+                    list_row(cx.theme().border)
                         .child(
                             div()
                                 .flex()
                                 .flex_col()
                                 .gap(px(2.0))
                                 .child(div().text_size(px(14.0)).child(p.name.clone()))
-                                .child(div().text_size(px(11.0)).text_color(rgb(0x9a9ba0)).child(format!(
-                                    "{} ・ 文字起こし{}件",
-                                    p.created_at.replacen('T', " ", 1),
-                                    p.transcript_count
-                                ))),
+                                .child(div().text_size(px(11.0)).text_color(cx.theme().muted_foreground).child(
+                                    format!(
+                                        "{} ・ 文字起こし{}件",
+                                        p.created_at.replacen('T', " ", 1),
+                                        p.transcript_count
+                                    ),
+                                )),
                         )
-                        .child(
-                            div()
-                                .id(format!("open-project-{id}"))
-                                .flex_none()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(rgb(0x3d3e42))
-                                .cursor_pointer()
-                                .child("開く")
-                                .on_click(move |_event, _window, cx| {
-                                    if let Some(strong) = weak_open.upgrade() {
-                                        let id = id.clone();
-                                        strong.update(cx, |this, cx| this.open_project_detail(id, cx));
-                                    }
-                                }),
-                        ),
+                        .child(Button::new(format!("open-project-{id}")).outline().label("開く").on_click(
+                            move |_event, _window, cx| {
+                                if let Some(strong) = weak_open.upgrade() {
+                                    let id = id.clone();
+                                    strong.update(cx, |this, cx| this.open_project_detail(id, cx));
+                                }
+                            },
+                        )),
                 );
             }
 
@@ -3878,31 +3907,25 @@ impl Render for AppRoot {
                 .flex_col()
                 .gap_4()
                 .p_4()
-                .bg(rgb(0x1e1e1e))
-                .text_color(rgb(0xdddddd))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(div().text_size(px(18.0)).child("プロジェクト"))
-                        .child(
-                            div()
-                                .id("open-settings-from-projects")
-                                .text_size(px(12.0))
-                                .text_color(rgb(0x9a9ba0))
-                                .cursor_pointer()
-                                .child("設定 (APIキー)")
-                                .on_click({
-                                    let weak = weak.clone();
-                                    move |_event, window, cx| {
-                                        if let Some(strong) = weak.upgrade() {
-                                            strong.update(cx, |this, cx| this.open_settings(window, cx));
-                                        }
-                                    }
-                                }),
-                        ),
-                )
+                .bg(cx.theme().background)
+                .text_color(cx.theme().foreground)
+                .child(screen_header(
+                    None,
+                    "プロジェクト",
+                    vec![Button::new("open-settings-from-projects")
+                        .ghost()
+                        .icon(IconName::Settings)
+                        .label("設定 (APIキー)")
+                        .on_click({
+                            let weak = weak.clone();
+                            move |_event, window, cx| {
+                                if let Some(strong) = weak.upgrade() {
+                                    strong.update(cx, |this, cx| this.open_settings(window, cx));
+                                }
+                            }
+                        })
+                        .into_any_element()],
+                ))
                 // "新規作成": a name-only project (see docs/plan.md's
                 // "プロジェクトの上位概念化" section -- a project's term
                 // dictionary needs to exist before any upload, so creation
@@ -3919,29 +3942,17 @@ impl Render for AppRoot {
                                 .clone()
                                 .map(|input| Input::new(&input).flex_1().text_size(px(13.0))),
                         )
-                        .child(
-                            div()
-                                .id("new-project")
-                                .flex_none()
-                                .px_3()
-                                .py_2()
-                                .rounded_md()
-                                .bg(rgb(0x5b9cf6))
-                                .text_color(rgb(0x0a0a0a))
-                                .cursor_pointer()
-                                .child("新規作成")
-                                .on_click({
-                                    let weak = weak.clone();
-                                    move |_event, _window, cx| {
-                                        if let Some(strong) = weak.upgrade() {
-                                            strong.update(cx, |this, cx| this.create_project(cx));
-                                        }
-                                    }
-                                }),
-                        ),
+                        .child(Button::new("new-project").primary().label("新規作成").on_click({
+                            let weak = weak.clone();
+                            move |_event, _window, cx| {
+                                if let Some(strong) = weak.upgrade() {
+                                    strong.update(cx, |this, cx| this.create_project(cx));
+                                }
+                            }
+                        })),
                 );
             if let Some(error) = &projects.error {
-                root = root.child(div().text_color(rgb(0xff8888)).text_size(px(12.0)).child(error.clone()));
+                root = root.child(Alert::error("projects-error", error.clone()));
             }
             return root
                 .child(div().id("projects-list").flex_1().min_h(px(0.0)).overflow_y_scroll().child(list_el))
@@ -4005,26 +4016,11 @@ impl Render for AppRoot {
 
             let AppScreen::ProjectDetail(detail) = &self.screen else { unreachable!("checked above") };
 
-            let mut terms_panel = div()
-                .id("terms-panel")
-                .flex_1()
-                .min_h(px(0.0))
-                .w_full()
-                .overflow_y_scroll()
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(0x333333))
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .flex_none()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(11.0))
-                        .text_color(rgb(0x9a9ba0))
-                        .child("用語辞書"),
-                );
+            // 2-column layout (用語辞書 | 文字起こし一覧) instead of the
+            // former "two stacked scroll regions" -- see docs/plan.md's
+            // "UIの刷新" section, rule 3 (2〜3カラムも利用する). Each side
+            // is its own `GroupBox` panel.
+            let mut terms_box = GroupBox::new().id("terms-panel-box").outline().title("用語辞書");
 
             for id in &detail.term_order {
                 let Some((surface_state, reading_state)) = detail.term_editors.get(id).cloned() else {
@@ -4037,7 +4033,7 @@ impl Render for AppRoot {
                 let delete_weak = weak.clone();
                 let delete_id = id.clone();
 
-                terms_panel = terms_panel.child(
+                terms_box = terms_box.child(
                     div()
                         .flex()
                         .items_center()
@@ -4045,19 +4041,15 @@ impl Render for AppRoot {
                         .px_2()
                         .py_1()
                         .border_b_1()
-                        .border_color(rgb(0x2a2a2a))
+                        .border_color(cx.theme().border)
                         .opacity(if enabled { 1.0 } else { 0.45 })
                         .child(Textarea::new(&surface_state).flex_1().text_size(px(13.0)).appearance(false))
                         .child(Textarea::new(&reading_state).flex_1().text_size(px(12.0)).appearance(false))
                         .child(
-                            div()
-                                .id(format!("term-enabled-{id}"))
-                                .flex_none()
-                                .px_1()
-                                .text_size(px(11.0))
-                                .text_color(rgb(0x9a9ba0))
-                                .cursor_pointer()
-                                .child(if enabled { "有効" } else { "無効" })
+                            Button::new(format!("term-enabled-{id}"))
+                                .text()
+                                .xsmall()
+                                .label(if enabled { "有効" } else { "無効" })
                                 .on_click(move |_event, _window, cx| {
                                     if let Some(strong) = toggle_weak.upgrade() {
                                         strong.update(cx, |this, cx| this.toggle_term_enabled(toggle_id.clone(), cx));
@@ -4065,19 +4057,13 @@ impl Render for AppRoot {
                                 }),
                         )
                         .child(
-                            div()
-                                .id(format!("term-delete-{id}"))
-                                .flex_none()
-                                .px_1()
-                                .text_size(px(11.0))
-                                .text_color(rgb(0x9a9ba0))
-                                .cursor_pointer()
-                                .child("削除")
-                                .on_click(move |_event, _window, cx| {
+                            Button::new(format!("term-delete-{id}")).text().xsmall().label("削除").on_click(
+                                move |_event, _window, cx| {
                                     if let Some(strong) = delete_weak.upgrade() {
                                         strong.update(cx, |this, cx| this.delete_term(delete_id.clone(), cx));
                                     }
-                                }),
+                                },
+                            ),
                         ),
                 );
             }
@@ -4088,7 +4074,7 @@ impl Render for AppRoot {
             // explicit" convention (see e.g. `EditorScreen::delete_segment`'s
             // doc comment).
             if let Some((new_surface_state, new_reading_state)) = detail.new_term_inputs.clone() {
-                terms_panel = terms_panel.child(
+                terms_box = terms_box.child(
                     div()
                         .flex_none()
                         .flex()
@@ -4098,34 +4084,22 @@ impl Render for AppRoot {
                         .py_1()
                         .child(Textarea::new(&new_surface_state).flex_1().text_size(px(13.0)))
                         .child(Textarea::new(&new_reading_state).flex_1().text_size(px(13.0)))
-                        .child(
-                            div()
-                                .id("term-add")
-                                .flex_none()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .bg(rgb(0x5b9cf6))
-                                .text_color(rgb(0x0a0a0a))
-                                .cursor_pointer()
-                                .child("追加")
-                                .on_click({
-                                    let weak = weak.clone();
-                                    move |_event, window, cx| {
-                                        if let Some(strong) = weak.upgrade() {
-                                            strong.update(cx, |this, cx| this.add_term(window, cx));
-                                        }
-                                    }
-                                }),
-                        ),
+                        .child(Button::new("term-add").primary().label("追加").on_click({
+                            let weak = weak.clone();
+                            move |_event, window, cx| {
+                                if let Some(strong) = weak.upgrade() {
+                                    strong.update(cx, |this, cx| this.add_term(window, cx));
+                                }
+                            }
+                        })),
                 );
             }
 
-            let mut transcript_list = div().flex().flex_col().gap_2();
+            let mut transcripts_box = GroupBox::new().id("transcripts-panel-box").outline().title("文字起こし一覧");
             if detail.transcripts.is_empty() {
-                transcript_list = transcript_list.child(
+                transcripts_box = transcripts_box.child(
                     div()
-                        .text_color(rgb(0x9a9ba0))
+                        .text_color(cx.theme().muted_foreground)
                         .text_size(px(13.0))
                         .child("まだ文字起こしがありません。「+ 新規アップロード」から始めてください。"),
                 );
@@ -4138,16 +4112,8 @@ impl Render for AppRoot {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| t.media_path.clone());
-                transcript_list = transcript_list.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_4()
-                        .px_2()
-                        .py_1()
-                        .border_b_1()
-                        .border_color(rgb(0x2a2a2a))
+                transcripts_box = transcripts_box.child(
+                    list_row(cx.theme().border)
                         .child(
                             div()
                                 .flex()
@@ -4157,28 +4123,18 @@ impl Render for AppRoot {
                                 .child(
                                     div()
                                         .text_size(px(11.0))
-                                        .text_color(rgb(0x9a9ba0))
+                                        .text_color(cx.theme().muted_foreground)
                                         .child(format!("{}件", t.segment_count)),
                                 ),
                         )
-                        .child(
-                            div()
-                                .id(format!("open-transcript-{media_id}"))
-                                .flex_none()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(rgb(0x3d3e42))
-                                .cursor_pointer()
-                                .child("開く")
-                                .on_click(move |_event, _window, cx| {
-                                    if let Some(strong) = weak_open.upgrade() {
-                                        let (project_id, media_id) = (project_id_for_open.clone(), media_id.clone());
-                                        strong.update(cx, |this, cx| this.open_media(project_id, media_id, cx));
-                                    }
-                                }),
-                        ),
+                        .child(Button::new(format!("open-transcript-{media_id}")).outline().label("開く").on_click(
+                            move |_event, _window, cx| {
+                                if let Some(strong) = weak_open.upgrade() {
+                                    let (project_id, media_id) = (project_id_for_open.clone(), media_id.clone());
+                                    strong.update(cx, |this, cx| this.open_media(project_id, media_id, cx));
+                                }
+                            },
+                        )),
                 );
             }
 
@@ -4189,58 +4145,64 @@ impl Render for AppRoot {
                 .flex_col()
                 .gap_4()
                 .p_4()
-                .bg(rgb(0x1e1e1e))
-                .text_color(rgb(0xdddddd))
+                .bg(cx.theme().background)
+                .text_color(cx.theme().foreground)
+                .child(screen_header(
+                    Some(back_nav_button("back-to-projects-from-detail", "プロジェクト一覧").on_click({
+                        let weak = weak.clone();
+                        move |_event, _window, cx| {
+                            if let Some(strong) = weak.upgrade() {
+                                strong.update(cx, |this, cx| this.back_to_projects(cx));
+                            }
+                        }
+                    })),
+                    detail.project_name.clone(),
+                    vec![],
+                ));
+            if let Some(error) = &detail.error {
+                root = root.child(Alert::error("project-detail-error", error.clone()));
+            }
+            return root
                 .child(
                     div()
                         .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(div().text_size(px(18.0)).child(detail.project_name.clone()))
+                        .gap_4()
+                        .flex_1()
+                        .min_h(px(0.0))
                         .child(
                             div()
-                                .id("back-to-projects-from-detail")
-                                .text_size(px(12.0))
-                                .text_color(rgb(0x9a9ba0))
-                                .cursor_pointer()
-                                .child("← プロジェクト一覧")
-                                .on_click({
+                                .id("terms-panel")
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .overflow_y_scroll()
+                                .child(terms_box),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("transcripts-panel")
+                                        .flex_1()
+                                        .min_h(px(0.0))
+                                        .overflow_y_scroll()
+                                        .child(transcripts_box),
+                                )
+                                .child(Button::new("new-upload").primary().label("+ 新規アップロード").on_click({
                                     let weak = weak.clone();
                                     move |_event, _window, cx| {
                                         if let Some(strong) = weak.upgrade() {
-                                            strong.update(cx, |this, cx| this.back_to_projects(cx));
+                                            let project_id = project_id_for_upload.clone();
+                                            strong.update(cx, |this, cx| this.open_upload(project_id, cx));
                                         }
                                     }
-                                }),
+                                })),
                         ),
                 )
-                .child(terms_panel)
-                .child(
-                    div()
-                        .id("new-upload")
-                        .flex_none()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(0x5b9cf6))
-                        .text_color(rgb(0x0a0a0a))
-                        .cursor_pointer()
-                        .child("+ 新規アップロード")
-                        .on_click({
-                            let weak = weak.clone();
-                            move |_event, _window, cx| {
-                                if let Some(strong) = weak.upgrade() {
-                                    let project_id = project_id_for_upload.clone();
-                                    strong.update(cx, |this, cx| this.open_upload(project_id, cx));
-                                }
-                            }
-                        }),
-                );
-            if let Some(error) = &detail.error {
-                root = root.child(div().text_color(rgb(0xff8888)).text_size(px(12.0)).child(error.clone()));
-            }
-            return root
-                .child(div().id("transcripts-list").flex_1().min_h(px(0.0)).overflow_y_scroll().child(transcript_list))
                 .into_any_element();
         }
 
@@ -4255,9 +4217,7 @@ impl Render for AppRoot {
 
         let status_area: AnyElement = match &upload.status {
             UploadStatus::Idle => div().into_any_element(),
-            UploadStatus::Failed(message) => {
-                div().text_color(rgb(0xff8080)).text_size(px(13.0)).child(message.clone()).into_any_element()
-            }
+            UploadStatus::Failed(message) => Alert::error("upload-status-error", message.clone()).into_any_element(),
             UploadStatus::Running(progress) => {
                 let snapshot = progress.lock().unwrap();
                 let (label, value, loading) = match &*snapshot {
@@ -4300,7 +4260,7 @@ impl Render for AppRoot {
                 .flex_col()
                 .gap_2()
                 .w(EXPLORE_PREVIEW_WIDTH)
-                .child(div().text_size(px(13.0)).text_color(rgb(0x9a9ba0)).child("話者数を分析中…"))
+                .child(div().text_size(px(13.0)).text_color(cx.theme().muted_foreground).child("話者数を分析中…"))
                 .child(Progress::new("explore-progress").value(0.0).loading(true))
                 .into_any_element(),
             ExploreState::Ready { total_duration_ms, slider, preview, distinct_speakers, painted_bounds, .. } => {
@@ -4314,7 +4274,7 @@ impl Render for AppRoot {
                     .child(
                         div()
                             .text_size(px(13.0))
-                            .text_color(rgb(0x9a9ba0))
+                            .text_color(cx.theme().muted_foreground)
                             .child(format!("検出された話者数: {distinct_speakers}人（推定、スライダーで調整可）")),
                     )
                     .child(Slider::new(slider).horizontal())
@@ -4331,111 +4291,112 @@ impl Render for AppRoot {
                     )
                     .into_any_element()
             }
-            ExploreState::Failed(message) => div()
-                .w(EXPLORE_PREVIEW_WIDTH)
-                .text_size(px(12.0))
-                .text_color(rgb(0xff8080))
-                .child(format!("話者数の事前分析に失敗しました（処理の開始自体は可能です）: {message}"))
-                .into_any_element(),
+            ExploreState::Failed(message) => Alert::error(
+                "explore-error",
+                format!("話者数の事前分析に失敗しました（処理の開始自体は可能です）: {message}"),
+            )
+            .w(EXPLORE_PREVIEW_WIDTH)
+            .into_any_element(),
         };
 
         div()
             .size_full()
             .flex()
             .flex_col()
-            .items_center()
-            .justify_center()
             .gap_4()
-            .bg(rgb(0x1e1e1e))
-            .text_color(rgb(0xdddddd))
-            .child(div().text_size(px(18.0)).child("音声/動画を文字起こし"))
-            .child(
-                div()
-                    .id("back-to-projects")
-                    .text_size(px(12.0))
-                    .text_color(if is_running { rgb(0x555555) } else { rgb(0x9a9ba0) })
-                    .when(!is_running, |el| el.cursor_pointer())
-                    .child("← プロジェクトに戻る")
-                    .on_click({
-                        let weak = weak.clone();
-                        move |_event, _window, cx| {
-                            if is_running {
-                                // Navigating away mid-run would abandon a
-                                // real (paid, time-costly) pipeline result --
-                                // the background worker keeps going, but the
-                                // polling loop in `start_pipeline` bails out
-                                // the instant `self.screen` isn't `Upload`
-                                // anymore, silently discarding whatever it
-                                // produces. Disabled while running instead
-                                // of trying to reconcile that.
-                                return;
+            .p_4()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(screen_header(
+                Some(
+                    back_nav_button("back-to-projects", "プロジェクトに戻る")
+                        .disabled(is_running)
+                        .on_click({
+                            let weak = weak.clone();
+                            move |_event, _window, cx| {
+                                if is_running {
+                                    // Navigating away mid-run would abandon a
+                                    // real (paid, time-costly) pipeline result --
+                                    // the background worker keeps going, but the
+                                    // polling loop in `start_pipeline` bails out
+                                    // the instant `self.screen` isn't `Upload`
+                                    // anymore, silently discarding whatever it
+                                    // produces. `.disabled(...)` above already
+                                    // dims/blocks it visually; this guard is the
+                                    // actual functional stop -- kept explicit
+                                    // rather than trusting the component's own
+                                    // disabled-click suppression.
+                                    return;
+                                }
+                                if let Some(strong) = weak.upgrade() {
+                                    let project_id = project_id_for_back.clone();
+                                    strong.update(cx, |this, cx| this.back_to_project_detail(project_id, cx));
+                                }
                             }
-                            if let Some(strong) = weak.upgrade() {
-                                let project_id = project_id_for_back.clone();
-                                strong.update(cx, |this, cx| this.back_to_project_detail(project_id, cx));
-                            }
-                        }
-                    }),
-            )
+                        }),
+                ),
+                "音声/動画を文字起こし",
+                vec![],
+            ))
             .child(
+                // Left (操作系) / right (情報系: 探索プレビュー) columns --
+                // see docs/plan.md's "UIの刷新" section, rule 3.
                 div()
-                    .id("pick-media")
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(0x3d3e42))
-                    .bg(rgb(0x2a2b2e))
-                    .cursor_pointer()
-                    .child("音声/動画を選ぶ")
-                    .child(div().text_color(rgb(0x9a9ba0)).child(filename))
-                    .on_click({
-                        let weak = weak.clone();
-                        move |_event, _window, cx| {
-                            if let Some(strong) = weak.upgrade() {
-                                strong.update(cx, |this, cx| this.pick_media(cx));
-                            }
-                        }
-                    }),
+                    .gap_4()
+                    .items_start()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .w(px(360.0))
+                            .child(
+                                Button::new("pick-media")
+                                    .outline()
+                                    .label(format!("音声/動画を選ぶ: {filename}"))
+                                    .on_click({
+                                        let weak = weak.clone();
+                                        move |_event, _window, cx| {
+                                            if let Some(strong) = weak.upgrade() {
+                                                strong.update(cx, |this, cx| this.pick_media(cx));
+                                            }
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Checkbox::new("skip-explore-checkbox")
+                                    .label("話者数の事前分析をスキップする")
+                                    .text_size(px(12.0))
+                                    .checked(upload.skip_explore)
+                                    .on_click({
+                                        let weak = weak.clone();
+                                        move |checked, _window, cx| {
+                                            if let Some(strong) = weak.upgrade() {
+                                                strong.update(cx, |this, cx| this.set_skip_explore(*checked, cx));
+                                            }
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new("start-pipeline")
+                                    .primary()
+                                    .label("処理を開始")
+                                    .loading(is_running)
+                                    .disabled(is_running)
+                                    .on_click({
+                                        let weak = weak.clone();
+                                        move |_event, _window, cx| {
+                                            if let Some(strong) = weak.upgrade() {
+                                                strong.update(cx, |this, cx| this.start_pipeline(cx));
+                                            }
+                                        }
+                                    }),
+                            )
+                            .child(status_area),
+                    )
+                    .child(explore_area),
             )
-            .child(
-                Checkbox::new("skip-explore-checkbox")
-                    .label("話者数の事前分析をスキップする")
-                    .text_size(px(12.0))
-                    .checked(upload.skip_explore)
-                    .on_click({
-                        let weak = weak.clone();
-                        move |checked, _window, cx| {
-                            if let Some(strong) = weak.upgrade() {
-                                strong.update(cx, |this, cx| this.set_skip_explore(*checked, cx));
-                            }
-                        }
-                    }),
-            )
-            .child(explore_area)
-            .child(
-                div()
-                    .id("start-pipeline")
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .bg(if is_running { rgb(0x2a2b2e) } else { rgb(0x5b9cf6) })
-                    .text_color(if is_running { rgb(0x666666) } else { rgb(0x0a0a0a) })
-                    .cursor_pointer()
-                    .child("処理を開始")
-                    .on_click({
-                        let weak = weak.clone();
-                        move |_event, _window, cx| {
-                            if let Some(strong) = weak.upgrade() {
-                                strong.update(cx, |this, cx| this.start_pipeline(cx));
-                            }
-                        }
-                    }),
-            )
-            .child(status_area)
             .into_any_element()
     }
 }
@@ -4445,9 +4406,40 @@ fn main() -> anyhow::Result<()> {
     let json_path_arg = args.next().map(PathBuf::from);
     let media_path_arg = args.next().map(PathBuf::from);
 
-    gpui_kit::application().run(move |cx| {
+    gpui_kit::application().with_assets(gpui_kit::assets::Assets).run(move |cx| {
         gpui_kit::init(cx);
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+        // Re-brand the theme's accent to this app's existing blue (was
+        // hardcoded as `rgb(0x5b9cf6)` all over `bin/app.rs`) instead of
+        // shadcn's default -- see docs/plan.md's "UIの刷新" section. Both
+        // the semantic `primary*` tokens AND the separate `button_primary*`
+        // tokens must be set: `Button::primary()` reads the latter, not the
+        // former (confirmed by reading `gpui-component-0.6.0/src/theme/
+        // mod.rs`'s own test for this exact pitfall) -- setting only one
+        // leaves the two visibly out of sync.
+        let accent = Hsla::parse_hex("#5b9cf6").expect("valid hex");
+        let accent_hover = accent.lighten(0.08);
+        let accent_active = accent.darken(0.08);
+        let on_accent = Hsla::parse_hex("#0a0a0a").expect("valid hex"); // matches the existing on-accent text color
+        {
+            let theme = gpui_kit::component::Theme::global_mut(cx);
+            theme.primary = accent;
+            theme.primary_hover = accent_hover;
+            theme.primary_active = accent_active;
+            theme.primary_foreground = on_accent;
+            theme.accent = accent;
+            theme.accent_foreground = on_accent;
+            theme.ring = accent;
+            theme.button_primary = accent;
+            theme.button_primary_hover = accent_hover;
+            theme.button_primary_active = accent_active;
+            theme.button_primary_foreground = on_accent;
+        }
+        // `Theme::global_mut`'s own doc comment: writing the public fields
+        // directly doesn't reach the Base layer (which paints the
+        // scrollbar/resize handles outside `gpui-component`) -- this pushes
+        // the change down, same as `Theme::change` does internally.
+        gpui_kit::component::Theme::sync_base(cx);
         cx.bind_keys([
             KeyBinding::new("cmd-down", NextSegment, None),
             KeyBinding::new("cmd-up", PreviousSegment, None),

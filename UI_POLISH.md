@@ -1,8 +1,8 @@
 # UIの刷新（後で着手する）
 
-`docs/plan.md`から分離した、承認済みだが未着手のUI刷新プラン。着手するタイミングが来たら、ここから`docs/plan.md`に戻して計画を立てる（`FEATURE.md`と同じ「後で戻ってくる置き場」の位置づけ）。
+`docs/plan.md`から分離した、承認済みだが未着手のUI刷新プランの置き場（`FEATURE.md`と同じ「後で戻ってくる置き場」の位置づけ）。
 
-セグメントリストのスクロール性能問題（`docs/plan.md`参照）を先に片付けるべき、というユーザー判断でこちらは保留になった。
+**進捗**: Settings・Projects・ProjectDetail・Uploadの4画面は`docs/plan.md`側で実装済み（テーマ/`Button`/`GroupBox`/`Alert`/`Icon`への移行、`screen_header`/`back_nav_button`/`list_row`の共有ヘルパー導入、ProjectDetail・Uploadの2カラム化）。**残るのは`Editor`画面のみ**——このアプリで最も複雑・最も行数が多い画面（`speaker_timeline`のcanvas描画、`gpui::list`の仮想化、ドラッグ操作、`player_button`/`zoom_button`/`loop_button`等の既存ローカルクロージャ、話者バッジの`style_speaker_pill`等）で、他画面より一段階リスクが高いため意図的に後回しにしている。
 
 ---
 
